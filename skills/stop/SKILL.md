@@ -6,21 +6,36 @@ user-invocable: true
 
 # Session Stop Skill
 
-> Graceful session close. Harvest → Archive → Settle → Cleanup.
+> Graceful session close. Harvest → Settle → Archive → Cleanup.
 
 **Plugin root** (resolved at load time):
 
 !`if [ -n "$CLAUDE_PLUGIN_ROOT" ]; then echo "$CLAUDE_PLUGIN_ROOT"; elif p=$(find ~/.claude/plugins -path '*/atlas-session-lifecycle/scripts/session-init.py' -type f 2>/dev/null | head -1) && [ -n "$p" ]; then dirname "$(dirname "$p")"; elif [ -f ~/.claude/skills/start/session-init.py ]; then echo "$HOME/.claude/skills/start"; else echo 'NOT_FOUND'; fi`
 
-Use the resolved path above as `PLUGIN_ROOT`.
+Use the resolved path above as `PLUGIN_ROOT`. If `NOT_FOUND`, tell user "Session lifecycle plugin not installed." and **EXIT**.
 
-**Script path**: `PLUGIN_ROOT/scripts/session-init.py` (via session-ops agent, never directly).
+**Script path** (resolved at load time):
+
+!`if [ -n "$CLAUDE_PLUGIN_ROOT" ] && [ -f "$CLAUDE_PLUGIN_ROOT/scripts/session-init.py" ]; then echo "$CLAUDE_PLUGIN_ROOT/scripts/session-init.py"; elif p=$(find ~/.claude/plugins -path '*/atlas-session-lifecycle/scripts/session-init.py' -type f 2>/dev/null | head -1) && [ -n "$p" ]; then echo "$p"; elif [ -f ~/.claude/skills/start/session-init.py ]; then echo "$HOME/.claude/skills/start/session-init.py"; else echo 'NOT_FOUND'; fi`
+
+Use the resolved path above as `SESSION_SCRIPT`.
 
 **AtlasCoin URL**:
 
 !`if [ -n "$ATLASCOIN_URL" ]; then echo "$ATLASCOIN_URL"; else echo "http://localhost:3000"; fi`
 
 Use the resolved URL above as `ATLASCOIN_URL`.
+
+---
+
+## Hard Invariants
+
+1. **User authority is absolute** — AI NEVER closes without confirmation.
+2. **Human-visible memory only** — All state lives in files.
+3. **Trust separation** — bounty-agent submits, finality-agent verifies. Never the same agent.
+4. **AtlasCoin is optional** — if down, skip bounty steps and continue closing.
+5. **Idempotent** — Running /stop on an already-closed session exits cleanly.
+6. **Archive after verification** — Soul purpose is archived AFTER bounty settlement, not before.
 
 ---
 
@@ -37,7 +52,7 @@ Use the resolved URL above as `ATLASCOIN_URL`.
 Cheap checks before paying team-spawn cost:
 
 1. `test -d session-context/` → if missing: tell user "No active session to close." **EXIT**.
-2. Read `session-context/CLAUDE-soul-purpose.md` → extract current soul purpose text (first non-header, non-blank line after `# Soul Purpose`). If empty or file missing: tell user "No active soul purpose." **EXIT**.
+2. Read `session-context/CLAUDE-soul-purpose.md` → extract current soul purpose text (first non-header, non-blank line after `# Soul Purpose`). If the extracted text is empty, starts with `[CLOSED]`, `---`, `##`, or `(No active soul purpose)`: tell user "No active soul purpose to close." **EXIT**.
 3. `test -f session-context/BOUNTY_ID.txt` → store `HAS_BOUNTY` (true/false). If true, read the bounty ID.
 
 ---
@@ -57,19 +72,15 @@ If "Close and set new purpose": ask a follow-up question for the new purpose tex
 
 ## Phase 2: Team Setup
 
-Check if a session-lifecycle team already exists:
+Always create a fresh team — do not attempt to reuse an existing one.
 
-```bash
-test -d ~/.claude/teams/session-lifecycle && echo "EXISTS" || echo "NO_TEAM"
-```
-
-**If EXISTS**: Read `~/.claude/teams/session-lifecycle/config.json` to discover existing members. Re-spawn any missing agents needed (session-ops is always needed; bounty-agent only if `HAS_BOUNTY`).
-
-**If NO_TEAM**: `TeamCreate("session-lifecycle")`, then spawn fresh.
+1. `TeamCreate("session-lifecycle")`
+2. Spawn session-ops (always needed)
+3. If `HAS_BOUNTY`: spawn bounty-agent
 
 ### Spawn session-ops
 
-Read `PLUGIN_ROOT/prompts/session-ops.md`. Replace `{SESSION_SCRIPT}` with the resolved script path, `{PROJECT_DIR}` with current working directory. Spawn:
+Read `PLUGIN_ROOT/prompts/session-ops.md`. Replace `{SESSION_SCRIPT}` with the resolved `SESSION_SCRIPT`, `{PROJECT_DIR}` with current working directory. Spawn:
 
 ```
 Task(name="session-ops", team_name="session-lifecycle", subagent_type="general-purpose", prompt=<resolved prompt>)
@@ -89,30 +100,39 @@ Task(name="bounty-agent", team_name="session-lifecycle", subagent_type="general-
 
 **Read `PLUGIN_ROOT/custom.md`** if it exists, and follow any instructions under "During Settlement".
 
-### Step 1: Harvest + Archive (via session-ops)
+**Error handling**: If any session-ops command fails, report the error to the user and ask: "Continue closing (skip failed step) or abort?" If abort, clean up team and **EXIT**.
 
-1. Message session-ops: run `harvest`.
-2. Receive harvest JSON. If promotable content exists:
+### Step 1: Validate + Harvest (via session-ops)
+
+1. Message session-ops: run `validate` (ensures session files are intact before operating on them).
+2. Message session-ops: run `harvest`.
+3. Receive harvest JSON. If promotable content exists:
    - **Main agent judges** what to promote (decisions need rationale, patterns must be reusable, troubleshooting must have verified solutions).
    - Present promotable items to user for approval.
    - After approval, append promoted content to target session-context files via Edit tool.
-3. Message session-ops: run `archive --old-purpose "CURRENT_SOUL_PURPOSE"` (add `--new-purpose "NEW_PURPOSE"` if user chose "Close and set new purpose").
 
 ### Step 2: Bounty Settlement (only if HAS_BOUNTY)
 
-1. Message bounty-agent: check bounty status via `GET /api/bounties/:id`.
-2. If bounty is active, message bounty-agent: submit solution via `POST /api/bounties/:id/submit`.
-3. Spawn finality-agent: Read `PLUGIN_ROOT/prompts/finality-agent.md`, replace `{SESSION_SCRIPT}`, `{PROJECT_DIR}`, `{ATLASCOIN_URL}`, `{BOUNTY_ID}`. Spawn as teammate.
-4. Finality-agent collects evidence and calls `POST /api/bounties/:id/verify`.
-5. **If PASSED**: Message bounty-agent to call `POST /api/bounties/:id/settle`. Tell user: "Soul purpose verified and settled. [X] AtlasCoin tokens earned."
-6. **If FAILED**: Ask user:
-   - "Fix and re-verify" → return to active work (exit /stop, keep team alive)
-   - "Close anyway (forfeit bounty)" → continue to cleanup
-   - "Continue working" → exit /stop, keep team alive
+1. Message bounty-agent: check AtlasCoin health first (`GET /api/health`). If unhealthy: tell user "AtlasCoin is not available. Skipping bounty settlement." and proceed to Step 3.
+2. Message bounty-agent: check bounty status via `GET /api/bounties/:id`.
+3. If bounty is active, message bounty-agent: submit solution via `POST /api/bounties/:id/submit`.
+4. Spawn finality-agent: Read `PLUGIN_ROOT/prompts/finality-agent.md`, replace `{SESSION_SCRIPT}`, `{PROJECT_DIR}`, `{ATLASCOIN_URL}`, `{BOUNTY_ID}`. Spawn as teammate.
+5. Finality-agent collects evidence and calls `POST /api/bounties/:id/verify`.
+6. **If PASSED**: Message bounty-agent to call `POST /api/bounties/:id/settle`. Tell user: "Soul purpose verified and settled. [X] AtlasCoin tokens earned."
+7. **If FAILED**: Ask user:
+   - "Close anyway (forfeit bounty)" → continue to Step 3
+   - "Continue working" → clean up team, **EXIT** (user returns to active work with purpose intact)
 
-### Step 3: Cleanup
+### Step 3: Archive (via session-ops)
 
-1. `SendMessage(type="shutdown_request")` to all active teammates (session-ops, bounty-agent, finality-agent).
-2. Wait for shutdown confirmations.
-3. `TeamDelete("session-lifecycle")`.
-4. Tell user: "Session closed. Soul purpose '[text]' archived." (Include token info if bounty was settled.)
+This runs AFTER bounty settlement so "continue working" can exit without corrupting state.
+
+Message session-ops: run `archive --old-purpose "CURRENT_SOUL_PURPOSE"` (add `--new-purpose "NEW_PURPOSE"` if user chose "Close and set new purpose").
+
+### Step 4: Cleanup
+
+1. Remove Ralph Loop indicator if present: `rm -f ~/.claude/ralph-loop.local.md`
+2. `SendMessage(type="shutdown_request")` to all active teammates (session-ops, bounty-agent, finality-agent).
+3. Wait for shutdown confirmations (timeout: 30 seconds per agent, then force-proceed).
+4. `TeamDelete("session-lifecycle")`.
+5. Tell user: "Session closed. Soul purpose '[text]' archived." (Include token info if bounty was settled.)
