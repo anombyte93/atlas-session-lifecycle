@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  commitlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install @commitlint/cli @commitlint/config-conventional
+      - name: Validate PR title (conventional commit)
+        run: echo "${{ github.event.pull_request.title }}" | ./node_modules/.bin/commitlint --config commitlint.config.js
