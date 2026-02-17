@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Pre-commit hook: block personal paths and private data from commits
+# Install: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+RESET='\033[0m'
+
+BLOCKED_PATTERNS=(
+  '/home/[a-zA-Z]'          # Personal home directory paths
+  '/Users/[a-zA-Z]'         # macOS home paths
+  '192\.168\.[0-9]'         # Private network IPs
+  '10\.[0-9]+\.[0-9]'      # Private network IPs
+  '@gmail\.com'             # Personal emails
+  '@outlook\.com'           # Personal emails
+  'chatGPTConvo'            # AI conversation dumps
+  'doubt\.md'               # Internal validation artifacts
+)
+
+PATTERN=$(IFS='|'; echo "${BLOCKED_PATTERNS[*]}")
+
+# Check staged files (skip binary files, the hook itself, and .gitignore)
+MATCHES=$(git diff --cached --diff-filter=ACMR -U0 -- . ':!*.png' ':!*.jpg' ':!*.gif' ':!*.ico' ':!.githooks/*' ':!.gitignore' | grep -E '^\+' | grep -vE '^\+\+\+' | grep -iE "$PATTERN" || true)
+
+if [[ -n "$MATCHES" ]]; then
+  printf "${RED}BLOCKED: Personal/private data detected in staged changes:${RESET}\n\n"
+  echo "$MATCHES" | head -20
+  printf "\n${RED}Fix these before committing. Use 'git commit --no-verify' to bypass (not recommended).${RESET}\n"
+  exit 1
+fi
+
+printf "${GREEN}Pre-commit: No personal data detected.${RESET}\n"
