@@ -8,12 +8,6 @@ user-invocable: true
 
 > User runs `/start`. Questions upfront. Everything else silent. Then seamlessly continue working.
 
-**Script path** (resolved at load time):
-
-!`if [ -n "$CLAUDE_PLUGIN_ROOT" ] && [ -f "$CLAUDE_PLUGIN_ROOT/scripts/session-init.py" ]; then echo "$CLAUDE_PLUGIN_ROOT/scripts/session-init.py"; elif p=$(find ~/.claude/plugins -path '*/atlas-session-lifecycle/scripts/session-init.py' -type f 2>/dev/null | head -1) && [ -n "$p" ]; then echo "$p"; elif [ -f ~/.claude/skills/start/session-init.py ]; then echo "$HOME/.claude/skills/start/session-init.py"; else echo 'NOT_FOUND'; fi`
-
-Use the resolved path above as `SESSION_SCRIPT` for all script invocations below.
-
 **Plugin root** (resolved at load time):
 
 !`if [ -n "$CLAUDE_PLUGIN_ROOT" ]; then echo "$CLAUDE_PLUGIN_ROOT"; elif p=$(find ~/.claude/plugins -path '*/atlas-session-lifecycle/scripts/session-init.py' -type f 2>/dev/null | head -1) && [ -n "$p" ]; then dirname "$(dirname "$p")"; elif [ -f ~/.claude/skills/start/session-init.py ]; then echo "$HOME/.claude/skills/start"; else echo 'NOT_FOUND'; fi`
@@ -26,8 +20,7 @@ Use the resolved path above as `PLUGIN_ROOT`.
 
 Use the resolved URL above as `ATLASCOIN_URL`.
 
-All commands output JSON. AI only handles judgment calls (questions, assessment, continuation).
-All infrastructure work is delegated to Agent Team teammates.
+All session operations use atlas-session MCP tools directly. AI only handles judgment calls (questions, assessment, continuation).
 
 ## Directive Capture
 
@@ -37,12 +30,11 @@ The skill NEVER finishes with "ready to go" and stops. After setup, immediately 
 ## UX Contract (MANDATORY)
 
 1. **NEVER announce step names** — no "Init Step 1", no "Wave 2"
-2. **NEVER narrate internal process** — no "Detecting environment...", no "Spawning session-ops..."
+2. **NEVER narrate internal process** — no "Detecting environment...", no "Calling MCP tools..."
 3. **NEVER explain what you're about to do** — just ask questions, then do it silently
 4. **User sees ONLY**: questions and seamless continuation into work
 5. **Batch questions** — as few rounds as possible
 6. **No "done" message that stops** — after setup, immediately begin working
-7. **Agent Teams are invisible** — user never sees team creation, task assignment, or teammate messages
 
 ## Hard Invariants
 
@@ -52,33 +44,32 @@ The skill NEVER finishes with "ready to go" and stops. After setup, immediately 
 4. **Idempotent** — Safe to run multiple times.
 5. **Templates are immutable** — NEVER edit bundled template files.
 6. **NEVER** auto-invoke doubt agent. Only offer it.
-7. **Trust separation** — bounty-agent creates bounties, finality-agent verifies them. Never the same agent.
+7. **Trust separation** — bounty creation and verification must use separate verification logic.
 8. **AtlasCoin is optional** — if the service is down, tell the user and continue without bounty tracking.
 
-## Agent Team Architecture
+## MCP Tool Reference
 
-All infrastructure work is performed by specialized teammates, not by the main agent running python directly.
+All session operations are performed via `atlas-session` MCP tools. The main thread calls these directly:
 
-### Teammates
+| Tool | Purpose |
+|------|---------|
+| `mcp__atlas-session__session_preflight` | Detect mode, git, CLAUDE.md, templates, session files |
+| `mcp__atlas-session__session_init` | Bootstrap session-context, seed active context |
+| `mcp__atlas-session__session_validate` | Check/repair session files from templates |
+| `mcp__atlas-session__session_read_context` | Read soul purpose + active context summary |
+| `mcp__atlas-session__session_harvest` | Scan active context for promotable content |
+| `mcp__atlas-session__session_archive` | Archive soul purpose, reset active context |
+| `mcp__atlas-session__session_check_clutter` | Scan root for misplaced files |
+| `mcp__atlas-session__session_cache_governance` | Cache governance sections from CLAUDE.md |
+| `mcp__atlas-session__session_restore_governance` | Restore cached governance sections |
+| `mcp__atlas-session__session_ensure_governance` | Add missing governance sections to CLAUDE.md |
+| `mcp__atlas-session__contract_health` | Check if AtlasCoin service is available |
+| `mcp__atlas-session__contract_create` | Create bounty with executable test criteria |
+| `mcp__atlas-session__contract_get_status` | Get current contract and bounty status |
+| `mcp__atlas-session__contract_run_tests` | Execute contract criteria deterministically |
+| `mcp__atlas-session__contract_submit` | Submit solution to AtlasCoin |
 
-| Name | Prompt | Lifecycle | Purpose |
-|------|--------|-----------|---------|
-| `session-ops` | `PLUGIN_ROOT/prompts/session-ops.md` | Init through brainstorm completion | Execute all session-init.py subcommands |
-| `bounty-agent` | `PLUGIN_ROOT/prompts/bounty-agent.md` | Spans entire session (dormant between setup and close) | AtlasCoin API interactions |
-| `finality-agent` | `PLUGIN_ROOT/prompts/finality-agent.md` | Only at session close | Verify soul purpose completion |
-
-### Spawning Pattern
-
-When spawning teammates, read the corresponding prompt template from `PLUGIN_ROOT/prompts/`, replace template variables (`{SESSION_SCRIPT}`, `{PROJECT_DIR}`, `{ATLASCOIN_URL}`, `{BOUNTY_ID}`), and pass the result as the task prompt.
-
-```
-Task(
-  name="<agent-name>",
-  team_name="session-lifecycle",
-  subagent_type="general-purpose",
-  prompt=<resolved prompt template>
-)
-```
+All tools take `project_dir: str` as the first parameter. Use the current working directory.
 
 ---
 
@@ -86,20 +77,17 @@ Task(
 
 > Triggered when preflight returns `"mode": "init"`.
 
-## Step 1: Team Setup + Preflight
+## Step 1: Preflight
 
-Create the team and dispatch preflight:
+Call `mcp__atlas-session__session_preflight` with the current project directory.
 
-1. `TeamCreate("session-lifecycle")`
-2. `TaskCreate("Run preflight check")` → task-1
-3. `TaskCreate("Bootstrap session context")` → task-2, blocked by task-1
-4. `TaskCreate("Create AtlasCoin bounty")` → task-3, blocked by task-2
+The result includes:
+- `mode`: "init" or "reconcile"
+- `project_signals`: existing files, readme, code presence
+- `root_file_count`: number of files at project root
+- `is_git`: whether the project is a git repository
 
-Spawn `session-ops` teammate with its prompt template. Assign task-1 to session-ops.
-
-**In parallel** with session-ops running preflight, ask the user Ralph questions:
-
-Use AskUserQuestion with 1-2 questions (Question 2 only if Ralph = Automatic):
+**In parallel**, ask the user Ralph questions:
 
 **Question 1**: "How should Ralph Loop work?"
 - Options: "Automatic", "Manual", "Skip"
@@ -111,7 +99,7 @@ Store as `RALPH_MODE`, `RALPH_INTENSITY` (default to "Small" if Automatic but no
 
 ## Step 2: Determine Brainstorm Weight
 
-Using `DIRECTIVE` and `project_signals` from session-ops preflight result, classify:
+Using `DIRECTIVE` and `project_signals` from preflight result, classify:
 
 | Condition | Weight | Brainstorm Behavior |
 |-----------|--------|---------------------|
@@ -124,7 +112,7 @@ Store `BRAINSTORM_WEIGHT` and `BRAINSTORM_CONTEXT` for use in Step 4.
 
 ### File organization (only if `root_file_count > 15`)
 
-Message session-ops to run `check-clutter`.
+Call `mcp__atlas-session__session_check_clutter`.
 
 If result `status` is "cluttered", present the grouped move map to the user for approval:
 
@@ -132,26 +120,33 @@ If result `status` is "cluttered", present the grouped move map to the user for 
 - Options: "Yes, clean up", "Show details first", "Skip"
 
 **If "Show details first"**: Display the full `moves_by_dir` grouped listing, then re-ask.
-**If "Yes, clean up"**: Message session-ops to execute the moves (using `git mv` if `is_git`).
+**If "Yes, clean up"**: Execute the moves (using `git mv` if `is_git`).
 **If "Skip"**: Continue.
 
 ## Step 3: Silent Bootstrap
 
-Message session-ops to run the bootstrap sequence with the user's Ralph answers:
+Call MCP tools in sequence:
 
-1. `init --soul-purpose "DIRECTIVE_OR_PENDING" --ralph-mode "RALPH_MODE" --ralph-intensity "RALPH_INTENSITY"`
-2. `ensure-governance --ralph-mode "RALPH_MODE" --ralph-intensity "RALPH_INTENSITY"`
-3. `cache-governance`
+1. `mcp__atlas-session__session_init` with:
+   - `project_dir`: current directory
+   - `soul_purpose`: DIRECTIVE or "(Pending brainstorm)"
+   - `ralph_mode`: RALPH_MODE
+   - `ralph_intensity`: RALPH_INTENSITY
 
-Wait for session-ops to complete and report success.
+2. `mcp__atlas-session__session_ensure_governance` with:
+   - `project_dir`: current directory
+   - `ralph_mode`: RALPH_MODE
+   - `ralph_intensity`: RALPH_INTENSITY
+
+3. `mcp__atlas-session__session_cache_governance` with `project_dir`
 
 Then run `/init` in main thread (Claude Code built-in that refreshes CLAUDE.md — must be main thread).
 
-Then message session-ops to run `restore-governance`.
+Then call `mcp__atlas-session__session_restore_governance` with `project_dir`.
 
 **Then read the plugin's `custom.md`** if it exists (at `PLUGIN_ROOT/custom.md`), and follow any instructions under "During Init".
 
-## Step 4: Brainstorm + AtlasCoin Bounty + Continuation
+## Step 4: Brainstorm + Bounty + Continuation
 
 Transition directly into work. No "session initialized" message.
 
@@ -165,18 +160,17 @@ Invoke brainstorming with the weight and context determined in Step 2:
 
 After brainstorm completes, write the derived soul purpose:
 
-1. Message session-ops to run: `archive --old-purpose "DIRECTIVE_OR_PENDING" --new-purpose "DERIVED_SOUL_PURPOSE"`
+1. Call `mcp__atlas-session__session_archive` with:
+   - `project_dir`: current directory
+   - `old_purpose`: DIRECTIVE or "(Pending brainstorm)"
+   - `new_purpose`: DERIVED_SOUL_PURPOSE
 
-2. **Spawn bounty-agent** with its prompt template. Message bounty-agent to:
-   - Check AtlasCoin health
-   - If healthy: create bounty with escrow based on Ralph intensity (see Escrow Scaling below)
+2. **Create bounty** (if AtlasCoin is available):
+   - Call `mcp__atlas-session__contract_health` to check if AtlasCoin service is running
+   - If healthy: call `mcp__atlas-session__contract_create` with escrow based on Ralph intensity (see Escrow Scaling below)
    - Write `BOUNTY_ID.txt` to `session-context/`
 
-3. **If AtlasCoin is down**: bounty-agent reports failure. Main agent tells user: "AtlasCoin is not available at {URL}. Start the service or check the connection. Continuing without bounty tracking."
-
-4. **Shutdown session-ops**: `SendMessage(type="shutdown_request", recipient="session-ops")`
-
-5. **bounty-agent stays alive** (dormant) — needed at session close for settlement.
+3. **If AtlasCoin is down**: Tell user: "AtlasCoin is not available at {URL}. Start the service or check the connection. Continuing without bounty tracking."
 
 ### Escrow Scaling
 
@@ -200,7 +194,7 @@ Construct the invocation based on `RALPH_INTENSITY`:
 
 Replace `SOUL_PURPOSE` with the derived soul purpose text. Quote the full prompt if it contains spaces.
 
-**CRITICAL**: You must call the `Skill` tool — not just mention it in text. The Ralph Loop only activates when `setup-ralph-loop.sh` runs via the Skill tool invocation.
+**CRITICAL**: You must call the `Skill` tool — not just mention it in text.
 
 ---
 
@@ -208,35 +202,37 @@ Replace `SOUL_PURPOSE` with the derived soul purpose text. Quote the full prompt
 
 > Triggered when preflight returns `"mode": "reconcile"`.
 
-**CRITICAL UX REMINDER**: Everything in Steps 1-2 is invisible to the user. Do NOT output "Running reconcile mode", "Assessing context", "Reading soul purpose", "Creating team", or ANY description of what you are doing. The user's first visible interaction is either a question (Step 3) or seamless continuation into work (Step 4). Nothing before that.
+**CRITICAL UX REMINDER**: Everything in Steps 1-2 is invisible to the user. Do NOT output "Running reconcile mode", "Assessing context", "Reading soul purpose", or ANY description of what you are doing. The user's first visible interaction is either a question (Step 3) or seamless continuation into work (Step 4). Nothing before that.
 
-## Step 1: Team Setup + Silent Assessment
+## Step 1: Silent Assessment
 
-1. `TeamCreate("session-lifecycle")`
-2. `TaskCreate("Validate and read context")` → task-1
-3. `TaskCreate("Check root clutter")` → task-2, blocked by task-1
-4. `TaskCreate("Check bounty status")` → task-3 (independent)
+Call MCP tools in sequence:
 
-Spawn session-ops and bounty-agent **in parallel**:
+1. `mcp__atlas-session__session_validate` with `project_dir` — repairs any missing session files
+2. `mcp__atlas-session__session_cache_governance` with `project_dir`
+3. Run `/init` in main thread
+4. `mcp__atlas-session__session_restore_governance` with `project_dir`
+5. `mcp__atlas-session__session_read_context` with `project_dir`
 
-- **session-ops**: Assign task-1. Runs: `validate` → `cache-governance` → reports ready.
-- **bounty-agent**: Assign task-3. Reads `session-context/BOUNTY_ID.txt`, checks bounty status via `GET /api/bounties/:id`. If no BOUNTY_ID.txt exists, reports "No existing bounty".
+The `read_context` result includes:
+- `soul_purpose`: current soul purpose text
+- `open_tasks`: any incomplete tasks
+- `status_hint`: "no_purpose", "in_progress", "probably_complete", etc.
+- `ralph_mode`: "automatic", "manual", or "skip"
+- `ralph_intensity`: "small", "medium", or "long"
 
-Wait for session-ops to report validation complete.
-
-Run `/init` in main thread.
-
-Message session-ops to run: `restore-governance` → `read-context`.
-
-Receive `read-context` JSON and bounty status from their respective agents.
+**Check bounty status** (in parallel with read_context):
+- Read `session-context/BOUNTY_ID.txt` if it exists
+- Call `mcp__atlas-session__contract_get_status` with the bounty ID
+- If no BOUNTY_ID.txt exists, bounty status is "none"
 
 **Then read the plugin's `custom.md`** if it exists (at `PLUGIN_ROOT/custom.md`), and follow any instructions under "During Reconcile".
 
 ### Root Cleanup Check
 
-Use `root_file_count` from preflight (already available from session-ops).
+Use `root_file_count` from preflight.
 
-**If `root_file_count > 15`**: Message session-ops to run `check-clutter`.
+**If `root_file_count > 15`**: Call `mcp__atlas-session__session_check_clutter`.
 
 If result `status` is "cluttered", present the move map to the user as part of Step 3 questions:
 
@@ -244,13 +240,13 @@ If result `status` is "cluttered", present the move map to the user as part of S
 - Options: "Yes, clean up", "Show details first", "Skip"
 
 **If "Show details first"**: Display the full `moves_by_dir` grouped listing, then re-ask.
-**If "Yes, clean up"**: Message session-ops to execute the moves.
+**If "Yes, clean up"**: Execute the moves.
 **If "Skip"**: Continue.
 
 ## Step 2: Directive Check + Self-Assessment
 
 **If DIRECTIVE is non-empty (3+ words) AND `status_hint` is `no_purpose`**:
-- Message session-ops to set soul purpose to DIRECTIVE via archive command
+- Call `mcp__atlas-session__session_archive` to set soul purpose to DIRECTIVE
 - Skip Step 3, go to Step 4 with a lightweight brainstorm to confirm direction
 
 **If DIRECTIVE is non-empty (3+ words) AND soul purpose exists**:
@@ -258,7 +254,7 @@ If result `status` is "cluttered", present the move map to the user as part of S
 
 **Otherwise** (no directive): Proceed with self-assessment below.
 
-Using the `read-context` JSON output, classify:
+Using the `read_context` result, classify:
 
 | Classification | Criteria |
 |---------------|----------|
@@ -286,24 +282,22 @@ Ask ONE question combining assessment, bounty status, and decision:
 Transition directly into work. No "session reconciled" message.
 
 - **If DIRECTIVE provided**: Begin working on directive.
-- **If `ralph_mode` = "automatic"** (from `read-context` JSON): Check if Ralph Loop should start — see "Ralph Loop Invocation (Reconcile)" below.
+- **If `ralph_mode` = "automatic"** (from `read_context`): Check if Ralph Loop should start — see "Ralph Loop Invocation (Reconcile)" below.
 - **If soul purpose just redefined**: Begin working on new purpose.
 - **If `clearly_incomplete`**: Pick up where last session left off using active context.
-- **If no active soul purpose**: Ask user what to work on, write as new soul purpose via archive command (through session-ops).
+- **If no active soul purpose**: Ask user what to work on, write as new soul purpose via `mcp__atlas-session__session_archive`.
 - **Otherwise**: Resume work using active context as guide.
-
-Before continuing, shutdown session-ops (no longer needed for active work). Keep bounty-agent dormant for potential session close later.
 
 ### Ralph Loop Invocation (Reconcile)
 
-When `ralph_mode` from `read-context` is "automatic", first check if Ralph Loop is already active:
+When `ralph_mode` from `read_context` is "automatic", first check if Ralph Loop is already active:
 
 ```bash
 test -f ~/.claude/ralph-loop.local.md && echo "active" || echo "inactive"
 ```
 
 - **If active**: Skip invocation. Ralph Loop is already running or was already set up this session.
-- **If inactive**: Use the `Skill` tool to start Ralph Loop. Read `ralph_intensity` from the `read-context` JSON and use the same intensity table as Init mode.
+- **If inactive**: Use the `Skill` tool to start Ralph Loop. Read `ralph_intensity` from the `read_context` result and use the same intensity table as Init mode.
 
 **CRITICAL**: You must call the `Skill` tool — not just mention it in text.
 
@@ -317,43 +311,30 @@ test -f ~/.claude/ralph-loop.local.md && echo "active" || echo "inactive"
 
 ## Step 1: Harvest + Archive
 
-Message session-ops (re-spawn if already shut down) to run:
-
-1. `harvest` — check for promotable content
+1. Call `mcp__atlas-session__session_harvest` with `project_dir` — check for promotable content
 2. If harvest returns content, AI assesses what to promote (judgment call — decisions need rationale, patterns must be reused, troubleshooting must have verified solutions). Present to user for approval. After approval, append promoted content to target files via Edit tool.
-3. `archive --old-purpose "OLD_PURPOSE_TEXT" --new-purpose "NEW_PURPOSE_TEXT"` (omit `--new-purpose` for close-without-redefine)
+3. Call `mcp__atlas-session__session_archive` with:
+   - `project_dir`: current directory
+   - `old_purpose`: OLD_PURPOSE_TEXT
+   - `new_purpose`: NEW_PURPOSE_TEXT (omit for close-without-redefine)
 
 **If "Close" without new purpose**: Ask if user wants to set a new soul purpose. If declined, the archive command writes "(No active soul purpose)".
 
 ## Step 2: Bounty Submission + Verification
 
-**If bounty exists** (BOUNTY_ID.txt present and bounty-agent confirmed active bounty):
+**If bounty exists** (BOUNTY_ID.txt present and bounty status confirmed active):
 
-1. Message bounty-agent to submit solution:
-   ```
-   POST /api/bounties/:id/submit
-   Body: { claimant: "session-agent", stakeAmount: <STAKE>, evidence: { soul_purpose, commits_summary } }
-   ```
+1. Call `mcp__atlas-session__contract_run_tests` to execute contract criteria
+2. If tests pass, call `mcp__atlas-session__contract_submit` with evidence:
+   - `soul_purpose`: from read_context
+   - `commits_summary`: from `git log --oneline -20`
+   - `open_tasks`: from read_context
+   - `session_files_have_content`: check session-context files have real content
 
-2. Spawn finality-agent with its prompt template (replacing `{BOUNTY_ID}` with the actual ID):
-   ```
-   Task(name="finality-agent", team_name="session-lifecycle", subagent_type="general-purpose", prompt=<resolved finality prompt>)
-   ```
+3. **If verified (passed)**:
+   - Tell user: "Soul purpose verified and settled. [X] AtlasCoin tokens earned."
 
-3. Finality-agent collects evidence:
-   - Reads soul purpose + active context via `read-context`
-   - `git log --oneline -20`
-   - Checks open tasks in active context
-   - Checks session-context files have real content
-   - If soul purpose mentions tests → checks for test results
-
-4. Finality-agent calls `POST /api/bounties/:id/verify` with evidence
-
-5. **If verified (passed)**:
-   - Message bounty-agent to call `POST /api/bounties/:id/settle`
-   - Tokens distributed — tell user: "Soul purpose verified and settled. [X] AtlasCoin tokens earned."
-
-6. **If verification failed**:
+4. **If verification failed**:
    - Present failure to user with options: "Fix and re-verify" / "Close anyway (forfeit bounty)" / "Continue working"
    - **Fix and re-verify**: Return to active work, re-run settlement when ready
    - **Close anyway**: Bounty forfeited, session closes
@@ -361,38 +342,11 @@ Message session-ops (re-spawn if already shut down) to run:
 
 **If no bounty exists**: Skip settlement, just archive and close.
 
-## Step 3: Cleanup
-
-After settlement (or close-without-bounty):
-
-1. `SendMessage(type="shutdown_request")` to all remaining teammates (session-ops, bounty-agent, finality-agent)
-2. Wait for shutdown confirmations
-3. `TeamDelete("session-lifecycle")`
-
----
-
-# Script Reference
-
-All commands output JSON. Run from project root via session-ops teammate (never by main agent directly).
-
-| Command | Purpose |
-|---------|---------|
-| `preflight` | Detect mode, git, CLAUDE.md, templates, session files |
-| `init --soul-purpose "..." --ralph-mode "..." --ralph-intensity "..."` | Bootstrap session-context, seed active context |
-| `validate` | Check/repair session files from templates |
-| `cache-governance` | Cache governance sections from CLAUDE.md to /tmp |
-| `restore-governance` | Restore cached governance sections after /init |
-| `ensure-governance --ralph-mode "..." --ralph-intensity "..."` | Add missing governance sections to CLAUDE.md |
-| `read-context` | Read soul purpose + active context summary |
-| `harvest` | Scan active context for promotable content |
-| `archive --old-purpose "..." [--new-purpose "..."]` | Archive soul purpose, reset active context |
-| `check-clutter` | Scan root for misplaced files, return categorized move map |
-
 ---
 
 # Work Execution: Agent Teams Enforcement
 
-> The session-lifecycle team above handles session bootstrapping. This section governs how **actual work** (implementation, PRD tasks, Ralph Loop iterations) is executed.
+> The session lifecycle above handles bootstrapping and context management. This section governs how **actual work** (implementation, PRD tasks, Ralph Loop iterations) is executed.
 
 ## Rule: When 2+ Independent Tasks Exist, MUST Use Agent Teams
 
@@ -405,7 +359,7 @@ All commands output JSON. Run from project root via session-ops teammate (never 
 
 ## Work Team Pattern
 
-After brainstorm/PRD determines the work requires parallel execution, create a **separate** work team (distinct from session-lifecycle):
+After brainstorm/PRD determines the work requires parallel execution, create a **separate** work team:
 
 ```
 1. TeamCreate(team_name: "{project-slug}-work", description: "Soul purpose execution")
