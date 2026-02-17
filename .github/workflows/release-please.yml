@@ -11,3 +11,5 @@ permissions:
 jobs:
   release:
     uses: anombyte93/copilot/.github/workflows/reusable-release-please.yml@v1
+    with:
+      release-type: 'simple'
