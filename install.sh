@@ -13,6 +13,7 @@
 #   bash install.sh --check-update                 # check for newer version
 #   bash install.sh --no-extras                    # skip bundled extra skills
 #   bash install.sh --all                          # install all extras without prompting
+#   bash install.sh --setup-zai                    # register Zai MCP (cost-optimized agents)
 # ============================================================================
 
 set -euo pipefail
@@ -302,6 +303,113 @@ install_extra_skills() {
     fi
 }
 
+ZAI_MCP_REPO="https://github.com/anombyte93/zai-mcp.git"
+MCP_CONFIG="${HOME}/.claude/mcp_config.json"
+
+setup_zai_mcp() {
+    local extras_mode="${1:-ask}"
+    local zai_dir="${HOME}/.claude/mcp-servers/zai-mcp"
+
+    # Skip if not interactive and not --all
+    if [[ "${extras_mode}" == "none" ]]; then return 0; fi
+
+    # Check if already registered
+    if [[ -f "${MCP_CONFIG}" ]] && grep -q '"zaiMCP"' "${MCP_CONFIG}" 2>/dev/null; then
+        ok "Zai MCP already registered in mcp_config.json"
+        return 0
+    fi
+
+    printf "\n"
+    info "${BOLD}Zai MCP — Cost-Optimized Background Agents${RESET}"
+    info "Delegates expensive operations to Z.AI GLM agents (~10x cheaper)"
+    info "Optional: /start falls back to regular Task agents if skipped"
+    printf "\n"
+
+    local do_install="n"
+    if [[ "${extras_mode}" == "all" ]]; then
+        do_install="y"
+    elif [[ -t 0 ]]; then
+        printf "  Register Zai MCP server? [y/N] "
+        read -r do_install
+    fi
+
+    if [[ "${do_install}" != "y" ]] && [[ "${do_install}" != "Y" ]]; then
+        info "Skipped Zai MCP (can register later with --setup-zai)"
+        return 0
+    fi
+
+    require_cmd node
+    require_cmd npm
+
+    # Install or update Zai MCP server
+    if [[ -d "${zai_dir}" ]] && [[ -f "${zai_dir}/build/index.js" ]]; then
+        ok "Zai MCP server already built at ${zai_dir}"
+    else
+        info "Installing Zai MCP server..."
+        mkdir -p "${zai_dir}"
+        git clone --depth 1 --quiet "${ZAI_MCP_REPO}" "${zai_dir}" 2>/dev/null \
+            || die "Failed to clone Zai MCP repository."
+        (cd "${zai_dir}" && npm install --silent 2>/dev/null && npm run build --silent 2>/dev/null) \
+            || die "Failed to build Zai MCP server."
+        ok "Built Zai MCP server"
+    fi
+
+    # Get API key
+    local api_key=""
+    if [[ -n "${Z_AI_API_KEY:-}" ]]; then
+        api_key="${Z_AI_API_KEY}"
+        ok "Using Z_AI_API_KEY from environment"
+    elif [[ -t 0 ]]; then
+        printf "  Z.AI API key (from https://z.ai/model-api): "
+        read -r api_key
+        if [[ -z "${api_key}" ]]; then
+            warn "No API key provided. Zai MCP registered but will fail without Z_AI_API_KEY."
+            api_key="REPLACE_WITH_YOUR_Z_AI_API_KEY"
+        fi
+    else
+        warn "No Z_AI_API_KEY in environment. Set it in mcp_config.json manually."
+        api_key="REPLACE_WITH_YOUR_Z_AI_API_KEY"
+    fi
+
+    # Register in mcp_config.json
+    if [[ ! -f "${MCP_CONFIG}" ]]; then
+        cat > "${MCP_CONFIG}" <<MCPEOF
+{
+  "mcpServers": {
+    "zaiMCP": {
+      "command": "node",
+      "args": ["${zai_dir}/build/index.js"],
+      "env": {
+        "Z_AI_API_KEY": "${api_key}"
+      }
+    }
+  }
+}
+MCPEOF
+        ok "Created ${MCP_CONFIG} with Zai MCP entry"
+    else
+        # Insert zaiMCP entry before the closing }} using python for safe JSON manipulation
+        python3 -c "
+import json, sys
+with open('${MCP_CONFIG}', 'r') as f:
+    config = json.load(f)
+config['mcpServers']['zaiMCP'] = {
+    'command': 'node',
+    'args': ['${zai_dir}/build/index.js'],
+    'env': {'Z_AI_API_KEY': '${api_key}'}
+}
+with open('${MCP_CONFIG}', 'w') as f:
+    json.dump(config, f, indent=2)
+" 2>/dev/null || die "Failed to update mcp_config.json (is python3 available?)"
+        ok "Added zaiMCP to ${MCP_CONFIG}"
+    fi
+
+    printf "\n"
+    ok "Zai MCP registered. Restart Claude Code to activate."
+    info "Tools available after restart: zai_spawn_agent, zai_agent_status, zai_agent_result, zai_list_agents, zai_cancel_agent"
+    printf "\n"
+}
+
 install_skill() {
     local target_version="${1:-v2}"
     local extras_mode="${2:-ask}"
@@ -381,6 +489,11 @@ install_skill() {
         install_extra_skills "${src_dir}" "${extras_mode}"
     fi
 
+    # Offer Zai MCP registration (v2 only)
+    if [[ "${target_version}" == "v2" ]]; then
+        setup_zai_mcp "${extras_mode}"
+    fi
+
     local timestamp; timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     cat > "${SKILL_DIR}/.version" <<VEOF
 ${VERSION}
@@ -429,6 +542,7 @@ main() {
     case "${args[0]:-}" in
         --check-update|-u) check_update ;;
         -v) echo "atlas-session-lifecycle v${VERSION}" ;;
+        --setup-zai) setup_zai_mcp "ask" ;;
         --revert) revert_to_v1 ;;
         --update)
             info "Updating atlas-session-lifecycle..."
@@ -451,6 +565,7 @@ main() {
             printf "  --check-update     Check for newer release\n"
             printf "  --all              Install all bundled skills without prompting\n"
             printf "  --no-extras        Skip bundled extra skills (only install /start)\n"
+            printf "  --setup-zai        Register Zai MCP server (cost-optimized GLM agents)\n"
             printf "  -v                 Print version\n"
             printf "  --help             Show help\n"
             printf "\nExamples:\n"

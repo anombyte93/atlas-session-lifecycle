@@ -14,6 +14,11 @@ Usage:
     session-init.py read-context                            # Read soul purpose + active context
     session-init.py harvest                                 # Scan for promotable content
     session-init.py archive --old-purpose "..." [--new-purpose "..."]
+    session-init.py hook-session-start                     # Context injection on session start
+    session-init.py hook-pre-compact                       # Re-inject soul purpose before compaction
+    session-init.py hook-stop                              # Block stop if soul purpose is active
+    session-init.py hook-activate --soul-purpose "..."     # Enable stop-hook enforcement
+    session-init.py hook-deactivate                        # Disable stop-hook enforcement
 """
 
 import argparse
@@ -86,6 +91,24 @@ After every session, update these files in `session-context/` with timestamp and
 **Mode**: {ralph_mode}
 **Intensity**: {ralph_intensity}""",
 }
+
+
+def _resolve_project_dir(project_dir=""):
+    """Resolve and chdir to project directory for hook commands."""
+    if project_dir and os.path.isdir(project_dir):
+        os.chdir(project_dir)
+        return
+    # Try git root
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True, timeout=2
+        )
+        root = result.stdout.strip()
+        if root and os.path.isdir(root):
+            os.chdir(root)
+    except Exception:
+        pass  # Stay in current dir
 
 
 def _out(data):
@@ -504,6 +527,196 @@ def cmd_archive(args):
     })
 
 
+# ── Hook Commands ─────────────────────────────────────────────────────────────
+
+LIFECYCLE_STATE_FILE = Path.home() / ".claude" / "session-lifecycle.local.md"
+
+
+def cmd_hook_session_start(args):
+    """Read session-context files and return systemMessage for context injection."""
+    _resolve_project_dir(args.project_dir)
+    try:
+        if not SESSION_DIR.is_dir():
+            _out({"decision": "approve"})
+            return
+
+        purpose = ""
+        focus = ""
+        open_count = 0
+        last_progress = ""
+
+        # Read soul purpose
+        sp_file = SESSION_DIR / "CLAUDE-soul-purpose.md"
+        if sp_file.is_file():
+            sp_content = sp_file.read_text()
+            for line in sp_content.split('\n'):
+                if '[CLOSED]' in line:
+                    break
+                if line.strip() and not line.startswith('#') and line.strip() != '---' and not line.strip().startswith('<!--'):
+                    if '(No active soul purpose)' not in line:
+                        purpose = line.strip()
+                        break
+
+        if not purpose:
+            _out({"decision": "approve"})
+            return
+
+        # Read active context
+        ac_file = SESSION_DIR / "CLAUDE-activeContext.md"
+        if ac_file.is_file():
+            ac_content = ac_file.read_text()
+            for line in ac_content.split('\n'):
+                stripped = line.strip()
+                if stripped.startswith('**Focus**:'):
+                    focus = stripped.split('**Focus**:', 1)[1].strip()
+                elif stripped.startswith('**Current Goal**:'):
+                    focus = focus or stripped.split('**Current Goal**:', 1)[1].strip()
+                elif '[ ]' in stripped:
+                    open_count += 1
+                elif '[x]' in stripped.lower():
+                    last_progress = stripped.lstrip('- ').replace('[x] ', '').replace('[X] ', '')
+
+        # Build concise systemMessage (<500 chars)
+        parts = [f"Session context: Soul purpose: '{purpose}'."]
+        if focus:
+            parts.append(f"Focus: {focus}.")
+        parts.append(f"Open tasks: {open_count}.")
+        if last_progress:
+            parts.append(f"Recent: {last_progress}.")
+
+        msg = ' '.join(parts)
+        if len(msg) > 500:
+            msg = msg[:497] + "..."
+
+        _out({"decision": "approve", "systemMessage": msg})
+
+    except Exception:
+        _out({"decision": "approve"})
+
+
+def cmd_hook_pre_compact(args):
+    """Re-inject soul purpose before context compaction."""
+    _resolve_project_dir(args.project_dir)
+    try:
+        sp_file = SESSION_DIR / "CLAUDE-soul-purpose.md"
+        if not sp_file.is_file():
+            _out({"decision": "approve"})
+            return
+
+        sp_content = sp_file.read_text()
+        purpose = ""
+        for line in sp_content.split('\n'):
+            if '[CLOSED]' in line:
+                break
+            if line.strip() and not line.startswith('#') and line.strip() != '---' and not line.strip().startswith('<!--'):
+                if '(No active soul purpose)' not in line:
+                    purpose = line.strip()
+                    break
+
+        if not purpose:
+            _out({"decision": "approve"})
+            return
+
+        # Count tasks from active context
+        open_count = 0
+        done_count = 0
+        ac_file = SESSION_DIR / "CLAUDE-activeContext.md"
+        if ac_file.is_file():
+            for line in ac_file.read_text().split('\n'):
+                stripped = line.strip()
+                if '[ ]' in stripped:
+                    open_count += 1
+                elif '[x]' in stripped.lower():
+                    done_count += 1
+
+        msg = f"CONTEXT RECOVERY: Soul purpose: '{purpose}'. {open_count} tasks open, {done_count} completed."
+        _out({"decision": "approve", "systemMessage": msg})
+
+    except Exception:
+        _out({"decision": "approve"})
+
+
+def cmd_hook_stop(args):
+    """Block stop if active soul purpose exists without completion signal."""
+    _resolve_project_dir(args.project_dir)
+    try:
+        if not LIFECYCLE_STATE_FILE.is_file():
+            _out({"decision": "approve"})
+            return
+
+        state_content = LIFECYCLE_STATE_FILE.read_text()
+
+        # Check if enforcement is inactive
+        if 'active: false' in state_content:
+            _out({"decision": "approve"})
+            return
+
+        # Extract soul purpose from state file
+        purpose = ""
+        for line in state_content.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('soul_purpose:'):
+                purpose = stripped.split('soul_purpose:', 1)[1].strip()
+                break
+
+        if not purpose:
+            _out({"decision": "approve"})
+            return
+
+        # Read stdin for hook input JSON - check stop_hook_active to prevent loops
+        try:
+            if not sys.stdin.isatty():
+                raw = sys.stdin.read(4096)  # Read up to 4KB, non-blocking enough
+                if raw:
+                    input_data = json.loads(raw)
+                    if input_data.get("stop_hook_active"):
+                        _out({"decision": "approve"})
+                        return
+        except Exception:
+            pass  # No valid input, continue with check
+
+        _out({
+            "decision": "block",
+            "reason": f"Soul purpose '{purpose}' is still active. Use /stop to properly close it, or force-close.",
+        })
+
+    except Exception:
+        _out({"decision": "approve"})
+
+
+def cmd_hook_activate(args):
+    """Create lifecycle state file to enable stop-hook enforcement."""
+    try:
+        LIFECYCLE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now(timezone.utc).isoformat()
+        safe_purpose = args.soul_purpose.replace('\n', ' ').replace("'", "''")
+        content = f"""---
+active: true
+soul_purpose: '{safe_purpose}'
+started_at: '{now}'
+---
+"""
+        LIFECYCLE_STATE_FILE.write_text(content)
+        _out({"status": "ok", "file": str(LIFECYCLE_STATE_FILE)})
+
+    except Exception as e:
+        _out({"status": "error", "message": str(e)})
+
+
+def cmd_hook_deactivate(args):
+    """Remove lifecycle state file to disable stop-hook enforcement."""
+    try:
+        removed = False
+        if LIFECYCLE_STATE_FILE.is_file():
+            LIFECYCLE_STATE_FILE.unlink()
+            removed = True
+        _out({"status": "ok", "removed": removed})
+
+    except Exception as e:
+        _out({"status": "error", "message": str(e)})
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -546,6 +759,25 @@ def main():
     arch_p.add_argument("--old-purpose", required=True)
     arch_p.add_argument("--new-purpose", default="")
 
+    # hook-session-start
+    hook_start_p = subparsers.add_parser("hook-session-start", help="Context injection on session start")
+    hook_start_p.add_argument("--project-dir", default="")
+
+    # hook-pre-compact
+    hook_compact_p = subparsers.add_parser("hook-pre-compact", help="Re-inject soul purpose before compaction")
+    hook_compact_p.add_argument("--project-dir", default="")
+
+    # hook-stop
+    hook_stop_p = subparsers.add_parser("hook-stop", help="Block stop if soul purpose is active")
+    hook_stop_p.add_argument("--project-dir", default="")
+
+    # hook-activate
+    ha_p = subparsers.add_parser("hook-activate", help="Enable stop-hook enforcement")
+    ha_p.add_argument("--soul-purpose", required=True)
+
+    # hook-deactivate
+    subparsers.add_parser("hook-deactivate", help="Disable stop-hook enforcement")
+
     args = parser.parse_args()
 
     commands = {
@@ -558,6 +790,11 @@ def main():
         "read-context": cmd_read_context,
         "harvest": cmd_harvest,
         "archive": cmd_archive,
+        "hook-session-start": cmd_hook_session_start,
+        "hook-pre-compact": cmd_hook_pre_compact,
+        "hook-stop": cmd_hook_stop,
+        "hook-activate": cmd_hook_activate,
+        "hook-deactivate": cmd_hook_deactivate,
     }
 
     commands[args.command](args)

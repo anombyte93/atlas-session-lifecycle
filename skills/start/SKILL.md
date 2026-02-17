@@ -1,6 +1,6 @@
 ---
 name: start
-description: "Session initialization and lifecycle management: bootstraps session context, organizes files, generates CLAUDE.md, manages soul purpose lifecycle with completion protocol and active context harvesting. Use when user says /start, /init, bootstrap session, initialize session, or organize project."
+description: "Session initialization and lifecycle management: bootstraps session context, organizes files, generates CLAUDE.md, manages soul purpose lifecycle with completion protocol, feature contract extraction, and active context harvesting. Use when user says /start, /init, bootstrap session, initialize session, or organize project."
 user-invocable: true
 ---
 
@@ -16,11 +16,75 @@ Use the resolved path above as `PLUGIN_ROOT`.
 
 **AtlasCoin URL** (resolved at load time):
 
-!`if [ -n "$ATLASCOIN_URL" ]; then echo "$ATLASCOIN_URL"; else echo "http://localhost:3000"; fi`
+!`if [ -n "$ATLASCOIN_URL" ]; then echo "$ATLASCOIN_URL"; else echo "http://localhost:3002"; fi`
 
 Use the resolved URL above as `ATLASCOIN_URL`.
 
 All session operations use atlas-session MCP tools directly. AI only handles judgment calls (questions, assessment, continuation).
+
+## Zai MCP Integration (Optional Cost Optimization)
+
+When the Zai MCP server is configured, expensive operations are delegated to cheap GLM agents (~10x cheaper than Claude Max). **Zai is optional** — if unavailable, everything falls back to built-in skills and Task agents.
+
+**Detection**: At the start of Init or Reconcile, check if `mcp__zaiMCP__zai_spawn_agent` is available via ToolSearch. Store result as `ZAI_AVAILABLE` (boolean).
+
+**Zai tools** (when available):
+
+| Tool | Purpose |
+|------|---------|
+| `mcp__zaiMCP__zai_spawn_agent` | Spawn a background agent (task, isolation, model, timeout_minutes) |
+| `mcp__zaiMCP__zai_agent_status` | Check agent progress (agent_id) |
+| `mcp__zaiMCP__zai_agent_result` | Get completed agent output (agent_id) |
+| `mcp__zaiMCP__zai_list_agents` | List all active/recent agents |
+| `mcp__zaiMCP__zai_cancel_agent` | Cancel a running agent (agent_id) |
+
+**Isolation modes**: `worktree` (code changes in isolated branch), `shared` (read-only access to current files), `sandboxed` (temp directory).
+
+**Models**: `claude-3-5-haiku-20241022` (fastest/cheapest, maps to GLM flash), `claude-3-5-sonnet-20241022` (more capable, maps to GLM 4.7).
+
+### Zai Delegation Rules
+
+| Operation | With Zai | Without Zai (fallback) |
+|-----------|----------|----------------------|
+| Brainstorming | Spawn Zai agent with `shared` isolation + brainstorm context | Use `superpowers:brainstorming` skill |
+| Implementation work | Spawn Zai agent with `worktree` isolation per task | Use Claude Task agents via TeamCreate |
+| Research | Spawn Zai agent with `shared` isolation | Use Task agent with Explore subagent_type |
+| Session operations | Always direct MCP (never Zai) | Always direct MCP |
+| User decisions | Always main Claude (never Zai) | Always main Claude |
+
+### Zai Brainstorm Pattern
+
+When `ZAI_AVAILABLE` is true and brainstorm weight is **standard** or **full**:
+
+1. Call `mcp__zaiMCP__zai_spawn_agent` with:
+   - `task`: "You are a brainstorming assistant. Given this context: [BRAINSTORM_CONTEXT]. Generate: 1) A clear soul purpose statement, 2) Key constraints and trade-offs, 3) Recommended approach with alternatives. Output as structured markdown."
+   - `isolation`: "shared"
+   - `model`: "claude-3-5-sonnet-20241022" (use capable model for brainstorming)
+   - `timeout_minutes`: 10
+2. Poll `mcp__zaiMCP__zai_agent_status` until complete
+3. Get result via `mcp__zaiMCP__zai_agent_result`
+4. Present Zai's brainstorm output to user for refinement
+5. AI (main Claude) makes the final judgment call on soul purpose
+
+For **lightweight** brainstorms, skip Zai — main Claude handles directly (1-2 quick questions, minimal cost).
+
+### Zai Work Execution Pattern
+
+When `ZAI_AVAILABLE` is true and work requires implementation:
+
+1. Instead of `TeamCreate` + Claude Task agents, spawn Zai agents per task:
+   ```
+   mcp__zaiMCP__zai_spawn_agent:
+     task: "[Detailed task description with file paths, acceptance criteria]"
+     isolation: "worktree"  (for code changes)
+     model: "claude-3-5-haiku-20241022"  (cheap for implementation)
+     timeout_minutes: 30
+   ```
+2. Main Claude monitors via `zai_agent_status` and coordinates
+3. Review results via `zai_agent_result` — check git diffs before accepting
+4. Merge approved changes from worktree branches
+
+**File ownership still applies**: Each Zai agent gets its own worktree branch, preventing conflicts naturally.
 
 ## Directive Capture
 
@@ -146,7 +210,7 @@ Then call `mcp__atlas-session__session_restore_governance` with `project_dir`.
 
 **Then read the plugin's `custom.md`** if it exists (at `PLUGIN_ROOT/custom.md`), and follow any instructions under "During Init".
 
-## Step 4: Brainstorm + Bounty + Continuation
+## Step 4: Brainstorm + Features + Bounty + Continuation
 
 Transition directly into work. No "session initialized" message.
 
@@ -158,19 +222,36 @@ Invoke brainstorming with the weight and context determined in Step 2:
 - **standard**: Invoke `skill: "superpowers:brainstorming"` with args containing the `BRAINSTORM_CONTEXT`. Follow normal brainstorm flow but skip design doc if the task is clear enough.
 - **full**: Invoke `skill: "superpowers:brainstorming"` with full `BRAINSTORM_CONTEXT` args. Follow complete brainstorm flow including design doc.
 
-After brainstorm completes, write the derived soul purpose:
+After brainstorm completes:
 
-1. Call `mcp__atlas-session__session_archive` with:
+1. **Write soul purpose** via `mcp__atlas-session__session_archive` with:
    - `project_dir`: current directory
    - `old_purpose`: DIRECTIVE or "(Pending brainstorm)"
    - `new_purpose`: DERIVED_SOUL_PURPOSE
 
-2. **Create bounty** (if AtlasCoin is available):
+1b. **Activate Stop hook enforcement**:
+```bash
+python3 PLUGIN_ROOT/session-init.py hook-activate --soul-purpose "DERIVED_SOUL_PURPOSE"
+```
+This enables the Stop hook to block accidental session closes while the soul purpose is active.
+
+2. **Extract and approve features** (if DIRECTIVE contains user-facing claims):
+   - Read existing `CLAUDE-features.md` if it exists
+   - Parse DIRECTIVE and brainstorm output for user-facing claims
+   - Format each claim as: "As a [role], I can [action]"
+   - **If new claims found**: Ask user ONE question:
+     > "I identified these new features to track: [list claims]. Add to CLAUDE-features.md?"
+     - Options: "Yes, add all", "Let me edit first", "Skip"
+   - **If "Yes, add all"**: Append claims to `CLAUDE-features.md` with status `pending`
+   - **If "Let me edit first"**: Show the claims, let user modify, then add
+   - **If "Skip"**: Continue without adding
+
+3. **Create bounty** (if AtlasCoin is available):
    - Call `mcp__atlas-session__contract_health` to check if AtlasCoin service is running
    - If healthy: call `mcp__atlas-session__contract_create` with escrow based on Ralph intensity (see Escrow Scaling below)
    - Write `BOUNTY_ID.txt` to `session-context/`
 
-3. **If AtlasCoin is down**: Tell user: "AtlasCoin is not available at {URL}. Start the service or check the connection. Continuing without bounty tracking."
+4. **If AtlasCoin is down**: Tell user: "AtlasCoin is not available at {URL}. Start the service or check the connection. Continuing without bounty tracking."
 
 ### Escrow Scaling
 
@@ -188,13 +269,15 @@ Construct the invocation based on `RALPH_INTENSITY`:
 
 | Intensity | Skill tool call |
 |-----------|----------------|
-| **Small** | `skill: "ralph-wiggum:ralph-loop"`, `args: "SOUL_PURPOSE --max-iterations 5 --completion-promise 'Soul purpose fulfilled'"` |
-| **Medium** | `skill: "ralph-wiggum:ralph-loop"`, `args: "SOUL_PURPOSE --max-iterations 20 --completion-promise 'Soul purpose fulfilled and code tested'"` |
-| **Long** | First invoke `skill: "prd-taskmaster"`, `args: "SOUL_PURPOSE"`. Wait for PRD completion. THEN invoke `skill: "ralph-wiggum:ralph-loop"`, `args: "SOUL_PURPOSE --max-iterations 100 --completion-promise 'Must validate sequentially with 3x doubt agents and 1x finality agent'"` |
+| **Small** | `skill: "ralph-wiggum:ralph-loop"`, `args: "SOUL_PURPOSE --max-iterations 5 --completion-promise 'You must verify with the doubt agent before claiming soul purpose is fulfilled'"` |
+| **Medium** | `skill: "ralph-wiggum:ralph-loop"`, `args: "SOUL_PURPOSE --max-iterations 20 --completion-promise 'You must verify with the doubt agent before claiming soul purpose is fulfilled and code tested'"` |
+| **Long** | First invoke `skill: "prd-taskmaster"`, `args: "SOUL_PURPOSE"`. Wait for PRD completion. THEN invoke `skill: "ralph-wiggum:ralph-loop"`, `args: "SOUL_PURPOSE --max-iterations 100 --completion-promise 'You must verify sequentially with 3x doubt agents and 1x finality agent before claiming soul purpose is complete'"` |
 
 Replace `SOUL_PURPOSE` with the derived soul purpose text. Quote the full prompt if it contains spaces.
 
 **CRITICAL**: You must call the `Skill` tool — not just mention it in text.
+
+**MANDATORY**: Every Ralph Loop completion promise includes doubt agent verification. The AI MUST invoke the doubt agent and receive passing verification BEFORE outputting the `<promise>` completion tag. This is non-negotiable regardless of intensity level.
 
 ---
 
@@ -243,13 +326,22 @@ If result `status` is "cluttered", present the move map to the user as part of S
 **If "Yes, clean up"**: Execute the moves.
 **If "Skip"**: Continue.
 
-## Step 2: Directive Check + Self-Assessment
+## Step 2: Directive Check + Feature Status + Self-Assessment
+
+**Read feature status** from `CLAUDE-features.md` (if exists):
+- Count claims by status: `pending`, `verified`, `broken`
+- Store as `FEATURE_STATUS` for use in Step 3
 
 **If DIRECTIVE is non-empty (3+ words) AND `status_hint` is `no_purpose`**:
 - Call `mcp__atlas-session__session_archive` to set soul purpose to DIRECTIVE
+- **Activate Stop hook**: `python3 PLUGIN_ROOT/session-init.py hook-activate --soul-purpose "DIRECTIVE"`
+- **Extract new claims** from DIRECTIVE (see Step 4 feature extraction in INIT MODE)
 - Skip Step 3, go to Step 4 with a lightweight brainstorm to confirm direction
 
 **If DIRECTIVE is non-empty (3+ words) AND soul purpose exists**:
+- **Activate Stop hook**: `python3 PLUGIN_ROOT/session-init.py hook-activate --soul-purpose "DIRECTIVE"`
+- **Extract new claims** from DIRECTIVE
+- **If new claims found**: Ask user: "I identified these new features: [list]. Add to CLAUDE-features.md?"
 - Skip Step 3, go to Step 4 — work on directive (it overrides for this session)
 
 **Otherwise** (no directive): Proceed with self-assessment below.
@@ -265,15 +357,15 @@ Using the `read_context` result, classify:
 ## Step 3: User Interaction (conditional)
 
 ### If `clearly_incomplete`:
-No questions. Skip to continuation.
+No questions. Skip to continuation. Show feature status if available: "Features: [X] verified, [Y] pending, [Z] broken"
 
 ### If `probably_complete` or `uncertain`:
-Ask ONE question combining assessment, bounty status, and decision:
+Ask ONE question combining assessment, feature status, bounty status, and decision:
 
-"Soul purpose: '[purpose text]'. [1-2 sentence assessment]. [Bounty: active/none]. What would you like to do?"
+"Soul purpose: '[purpose text]'. [1-2 sentence assessment]. Features: [X verified, Y pending, Z broken]. [Bounty: active/none]. What would you like to do?"
 - Options: "Continue", "Verify first", "Close", "Redefine"
 
-**If "Verify first"**: Dispatch doubt-agent, fold findings into re-presented question (without "Verify first" option).
+**If "Verify first"**: Dispatch doubt-agent to verify features, fold findings into re-presented question (without "Verify first" option).
 
 **If "Close" or "Redefine"**: Run the Settlement Flow (see below).
 
@@ -320,7 +412,23 @@ test -f ~/.claude/ralph-loop.local.md && echo "active" || echo "inactive"
 
 **If "Close" without new purpose**: Ask if user wants to set a new soul purpose. If declined, the archive command writes "(No active soul purpose)".
 
-## Step 2: Bounty Submission + Verification
+## Step 2: Feature Verification + Bounty Submission
+
+**Verify features first** (if `CLAUDE-features.md` exists):
+
+1. Read `CLAUDE-features.md` and extract all claims with proof paths
+2. For each claim with proof:
+   - Run the proof (E2E test, unit test, etc.)
+   - Update status: `verified` if pass, `broken` if fail
+3. Count results: `[X] verified, [Y] broken, [Z] pending (no proof)`
+4. Write updated status back to `CLAUDE-features.md`
+
+**If any claims are `broken`**:
+- Present failure to user: "Feature verification failed: [list broken claims]"
+- Options: "Fix and re-verify" / "Close anyway (incomplete)" / "Continue working"
+- Do NOT submit bounty until all claims are `verified`
+
+**If all claims are `verified` OR no features file exists**, proceed to bounty:
 
 **If bounty exists** (BOUNTY_ID.txt present and bounty status confirmed active):
 
@@ -330,9 +438,10 @@ test -f ~/.claude/ralph-loop.local.md && echo "active" || echo "inactive"
    - `commits_summary`: from `git log --oneline -20`
    - `open_tasks`: from read_context
    - `session_files_have_content`: check session-context files have real content
+   - `features_verified`: count of verified claims from CLAUDE-features.md
 
 3. **If verified (passed)**:
-   - Tell user: "Soul purpose verified and settled. [X] AtlasCoin tokens earned."
+   - Tell user: "Soul purpose verified and settled. [X] AtlasCoin tokens earned. [Y] features verified."
 
 4. **If verification failed**:
    - Present failure to user with options: "Fix and re-verify" / "Close anyway (forfeit bounty)" / "Continue working"
@@ -340,7 +449,59 @@ test -f ~/.claude/ralph-loop.local.md && echo "active" || echo "inactive"
    - **Close anyway**: Bounty forfeited, session closes
    - **Continue working**: Return to Step 4 of Reconcile
 
-**If no bounty exists**: Skip settlement, just archive and close.
+**If no bounty exists**: Skip bounty submission, just archive and close.
+
+## Step 3: Deactivate Stop Hook
+
+Call `hook-deactivate` to remove the Stop hook enforcement:
+
+```bash
+python3 PLUGIN_ROOT/session-init.py hook-deactivate
+```
+
+This allows the session to close cleanly without the Stop hook blocking.
+
+## Step 4: Automatic PR Creation
+
+**If on a feature branch** (not `main` or `master`):
+
+1. Check current branch: `git branch --show-current`
+2. If branch is `main` or `master`: skip PR creation, notify user
+3. Push branch to remote: `git push -u origin BRANCH_NAME`
+4. Check if PR already exists: `gh pr list --head BRANCH_NAME --state open`
+5. If PR exists: notify user with existing PR URL, skip creation
+6. If no PR exists, create one:
+
+```bash
+gh pr create --title "SOUL_PURPOSE_SHORT" --body "$(cat <<'EOF'
+## Summary
+
+Soul purpose: SOUL_PURPOSE_TEXT
+
+## Changes
+
+COMMITS_SUMMARY (from git log --oneline -20)
+
+## Verification
+
+- Features verified: X
+- Bounty status: settled/none
+- Doubt agent verification: passed/skipped
+
+---
+
+Generated by /start settlement flow
+EOF
+)"
+```
+
+7. Return PR URL to user
+
+**If no remote configured or `gh` not available**: Skip silently, notify user: "No remote configured. Push manually when ready."
+
+**User override**: Before creating PR, ask:
+> "Ready to create a PR from `BRANCH_NAME` to `main`. Proceed?"
+> Options: "Yes, create PR", "Skip PR", "Let me customize"
 
 ---
 
@@ -415,3 +576,58 @@ The AI reads `custom.md` at each lifecycle phase and follows matching instructio
 - **Always**: Applied in all modes
 
 To customize, just write what you want in English under the relevant heading. No code needed.
+
+---
+
+# Doubt Verification
+
+> Triggered when user says "I doubt [feature] works" or chooses "Verify first" in Reconcile Step 3.
+
+## Feature Doubt Flow
+
+When user doubts a specific feature:
+
+1. **Read CLAUDE-features.md** to find the claim ID and proof path
+2. **Run the proof visibly**:
+   - For E2E tests: `npx playwright test --headed --grep "[feature name]"`
+   - For unit tests: Run with verbose output
+   - For manual proof: Open screenshot/video for user to see
+3. **Update status** in CLAUDE-features.md:
+   - If pass: `status: verified`, update `Verified` date
+   - If fail: `status: broken`, note failure reason
+4. **Report to user**: "Feature '[claim]' verified ✅" or "Feature '[claim]' broken ❌"
+
+## Visual Verification
+
+For maximum confidence (human-visible proof):
+
+1. Run Playwright with `--headed` flag (browser visible)
+2. Take screenshot at key moments
+3. User watches AI test the feature
+4. Screenshot saved to `docs/screenshots/` as evidence
+5. Update proof path to include screenshot
+
+Example:
+```
+User: "I doubt the login flow works"
+AI: Running login test visibly...
+    [Browser opens, fills form, submits]
+    ✅ Login successful. Screenshot saved.
+    Feature F1 verified.
+```
+
+## Integration with e2e-full
+
+When running `/e2e-full` skill:
+
+1. e2e-full discovers all features from codebase
+2. Generates tests for each user story
+3. **Writes to CLAUDE-features.md**: Maps each test to a claim
+4. Runs tests and updates status
+5. Creates PR with proof links
+
+This creates a feedback loop:
+- `/start` extracts claims → `CLAUDE-features.md`
+- `/e2e-full` generates tests → updates proof paths
+- Doubt verification → runs specific test → updates status
+- Settlement → all claims verified → bounty earned
