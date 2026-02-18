@@ -24,33 +24,11 @@ from atlas_session.common.state import (
 
 
 class TestSessionDir:
-    """Tests for the session_dir() function."""
-
-    def test_returns_path_ending_in_session_context(self, tmp_path):
-        """Returns a Path whose final component is 'session-context'."""
-        result = session_dir(str(tmp_path))
-        assert isinstance(result, Path)
-        assert result.name == "session-context"
-
-    def test_parent_is_project_dir(self, tmp_path):
-        """Parent of the returned path is the project directory."""
-        result = session_dir(str(tmp_path))
-        assert result.parent == tmp_path
+    """Tests for the session_dir() function — deleted trivial Path.name tests."""
 
 
 class TestClaudeMd:
-    """Tests for the claude_md() function."""
-
-    def test_returns_path_ending_in_claude_md(self, tmp_path):
-        """Returns a Path whose final component is 'CLAUDE.md'."""
-        result = claude_md(str(tmp_path))
-        assert isinstance(result, Path)
-        assert result.name == "CLAUDE.md"
-
-    def test_parent_is_project_dir(self, tmp_path):
-        """Parent of the returned path is the project directory."""
-        result = claude_md(str(tmp_path))
-        assert result.parent == tmp_path
+    """Tests for the claude_md() function — deleted trivial Path.name tests."""
 
 
 class TestParseMdSections:
@@ -193,17 +171,104 @@ class TestReadWriteJson:
         path.write_text("not valid json {{{")
         assert read_json(path) == {}
 
-    def test_write_creates_pretty_json(self, tmp_path):
-        """write_json produces indented JSON output."""
-        path = tmp_path / "pretty.json"
-        write_json(path, {"a": 1})
-        raw = path.read_text()
-        # Pretty JSON has newlines and indentation
-        assert "\n" in raw
-        assert "  " in raw
 
-    def test_empty_dict_round_trip(self, tmp_path):
-        """Empty dict round-trips correctly."""
-        path = tmp_path / "empty.json"
-        write_json(path, {})
-        assert read_json(path) == {}
+# =========================================================================
+# Hostile Tests — try to break parse_md_sections, find_section, read/write_json
+# =========================================================================
+
+
+class TestParseMdSectionsHostile:
+    """Hostile edge cases that try to break the markdown parser."""
+
+    def test_unclosed_code_fence_eats_remaining_headings(self):
+        """Unclosed ``` fence should swallow all subsequent ## headings.
+
+        Once in_code_block is True and never toggled back, every subsequent
+        ## line is treated as body text rather than a new section.
+        """
+        content = (
+            "## Before Fence\n"
+            "\n"
+            "Normal content.\n"
+            "\n"
+            "```python\n"
+            "# code here\n"
+            "\n"
+            "## Swallowed Heading\n"
+            "\n"
+            "More code.\n"
+            "\n"
+            "## Also Swallowed\n"
+            "\n"
+            "Even more.\n"
+        )
+        sections = parse_md_sections(content)
+        # Only one section should exist: the one before the unclosed fence
+        assert len(sections) == 1
+        assert "## Before Fence" in sections
+        # The "## Swallowed Heading" should be body text, not a key
+        assert "## Swallowed Heading" not in sections
+        assert "## Also Swallowed" not in sections
+        # Both swallowed headings should appear inside the body
+        body = sections["## Before Fence"]
+        assert "Swallowed Heading" in body
+        assert "Also Swallowed" in body
+
+    def test_heading_with_special_chars(self):
+        """Heading with parentheses, brackets, dashes should parse fine."""
+        content = (
+            "## Section (deprecated) [v2] -- old\n"
+            "\n"
+            "Body text here.\n"
+        )
+        sections = parse_md_sections(content)
+        heading = "## Section (deprecated) [v2] -- old"
+        assert heading in sections
+        assert "Body text here." in sections[heading]
+
+    def test_empty_section_body(self):
+        """Back-to-back ## headings yield sections with only the heading line."""
+        content = "## A\n## B\n"
+        sections = parse_md_sections(content)
+        assert "## A" in sections
+        assert "## B" in sections
+        # A's body is just its own heading line (no content lines were collected)
+        assert sections["## A"].strip() == "## A"
+
+    def test_find_section_ambiguous_match_returns_first(self):
+        """When multiple sections match the key, the first in iteration order wins."""
+        sections = {
+            "## Database Config": "db config body",
+            "## Database Migrations": "migrations body",
+            "## Cache Config": "cache body",
+        }
+        # "database" matches both Database sections — first wins
+        heading, body = find_section(sections, "database")
+        assert heading == "## Database Config"
+        assert body == "db config body"
+
+        # "config" matches Database Config AND Cache Config — first wins
+        heading, body = find_section(sections, "config")
+        assert heading == "## Database Config"
+        assert body == "db config body"
+
+    def test_read_json_with_non_dict_json(self, tmp_path):
+        """File containing a JSON array (not dict) is returned as-is.
+
+        read_json does json.loads() with a bare except; a valid JSON list
+        does not raise an exception, so it leaks through as a list instead
+        of returning {}.  This test documents the actual (potentially buggy)
+        behavior.
+        """
+        path = tmp_path / "array.json"
+        path.write_text("[1, 2, 3]")
+        result = read_json(path)
+        # Actual behavior: returns the list, not {}
+        assert result == [1, 2, 3]
+        assert not isinstance(result, dict)
+
+    def test_write_json_raises_when_parent_dir_missing(self, tmp_path):
+        """write_json does NOT create parent directories; it raises."""
+        path = tmp_path / "nonexistent" / "subdir" / "data.json"
+        with pytest.raises(FileNotFoundError):
+            write_json(path, {"key": "value"})

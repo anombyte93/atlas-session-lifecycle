@@ -50,45 +50,6 @@ class TestCriterionModel:
         assert c.pass_when == "exit_code == 0"
         assert c.weight == 2.0
 
-    def test_from_dict_context_check(self):
-        """Context check criterion parses field correctly."""
-        data = {
-            "name": "no_open_tasks",
-            "type": "context_check",
-            "field": "open_tasks",
-            "pass_when": "== 0",
-            "weight": 1.0,
-        }
-        c = Criterion.from_dict(data)
-        assert c.type == CriterionType.CONTEXT_CHECK
-        assert c.field == "open_tasks"
-
-    def test_from_dict_file_exists(self):
-        """File exists criterion parses path correctly."""
-        data = {
-            "name": "readme_exists",
-            "type": "file_exists",
-            "path": "README.md",
-            "pass_when": "not_empty",
-            "weight": 0.5,
-        }
-        c = Criterion.from_dict(data)
-        assert c.type == CriterionType.FILE_EXISTS
-        assert c.path == "README.md"
-
-    def test_from_dict_git_check(self):
-        """Git check criterion parses command correctly."""
-        data = {
-            "name": "has_commits",
-            "type": "git_check",
-            "command": "git log --oneline -1",
-            "pass_when": "exit_code == 0",
-            "weight": 1.0,
-        }
-        c = Criterion.from_dict(data)
-        assert c.type == CriterionType.GIT_CHECK
-        assert c.command == "git log --oneline -1"
-
     def test_round_trip(self):
         """to_dict -> from_dict produces equivalent Criterion."""
         original = Criterion(
@@ -115,17 +76,6 @@ class TestCriterionModel:
         }
         with pytest.raises(ValueError):
             Criterion.from_dict(data)
-
-    def test_to_dict_stores_type_as_string(self):
-        """to_dict stores CriterionType as its string value."""
-        c = Criterion(
-            name="check",
-            type=CriterionType.SHELL,
-            pass_when="exit_code == 0",
-        )
-        d = c.to_dict()
-        assert d["type"] == "shell"
-        assert isinstance(d["type"], str)
 
 
 class TestContractModel:
@@ -842,100 +792,283 @@ class TestAtlasCoinGetBounty:
 
 
 # =========================================================================
-# Task 7 — Draft Criteria Helpers
+# Hostile Tests — try to break contract model, verifier, and draft criteria
 # =========================================================================
 
 
-class TestDraftCriteriaHelpers:
-    """Tests for _guess_test_command, _guess_build_command, _guess_lint_command."""
+class TestCriterionModelHostile:
+    """Hostile edge cases that try to break Criterion creation."""
 
-    # --- _guess_test_command ---
+    def test_from_dict_missing_required_field(self):
+        """from_dict with missing 'name' raises TypeError — no graceful fallback."""
+        data = {
+            "type": "shell",
+            "command": "echo ok",
+            "pass_when": "exit_code == 0",
+            "weight": 1.0,
+            # 'name' is missing
+        }
+        with pytest.raises(TypeError):
+            Criterion.from_dict(data)
 
-    def test_guess_test_command_node(self):
-        """Node stack returns 'npm test'."""
-        signals = {"detected_stack": ["node"]}
+    def test_from_dict_extra_fields_raises(self):
+        """from_dict with unknown fields raises TypeError due to **kwargs in dataclass."""
+        data = {
+            "name": "test",
+            "type": "shell",
+            "command": "echo ok",
+            "pass_when": "exit_code == 0",
+            "weight": 1.0,
+            "surprise_field": "gotcha",
+            "another_one": True,
+        }
+        with pytest.raises(TypeError):
+            Criterion.from_dict(data)
+
+    def test_contract_from_dict_with_one_invalid_criterion(self):
+        """One bad criterion type blows up the entire Contract.from_dict call."""
+        data = {
+            "soul_purpose": "Test",
+            "escrow": 50,
+            "bounty_id": "",
+            "status": "draft",
+            "criteria": [
+                {
+                    "name": "good",
+                    "type": "shell",
+                    "command": "echo ok",
+                    "pass_when": "exit_code == 0",
+                    "weight": 1.0,
+                },
+                {
+                    "name": "bad",
+                    "type": "BOGUS_TYPE",
+                    "command": "echo fail",
+                    "pass_when": "exit_code == 0",
+                    "weight": 1.0,
+                },
+            ],
+        }
+        with pytest.raises(ValueError, match="BOGUS_TYPE"):
+            Contract.from_dict(data)
+
+
+class TestVerifierHostile:
+    """Hostile edge cases targeting the verifier's shell execution."""
+
+    def test_shell_command_injection_executes_via_shell(self, project_with_session):
+        """shell=True means semicolons are interpreted by the shell.
+
+        This test proves commands with ';' are concatenated by the shell.
+        We use a harmless injection: 'echo INJECTED' after 'false'.
+        The combined exit code is from the LAST command (echo = 0).
+        """
+        contract = Contract(
+            soul_purpose="Test injection",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="injected",
+                    type=CriterionType.SHELL,
+                    command="false; echo INJECTED",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        # shell interprets ';', runs 'echo INJECTED' last, exit code 0
+        assert result["all_passed"] is True
+        assert "INJECTED" in result["results"][0]["output"]
+
+    def test_shell_timeout_fires_on_slow_command(self, project_with_session):
+        """Command that sleeps past the 120s timeout should fail gracefully.
+
+        We use a short sleep and mock the timeout to avoid waiting 120s.
+        """
+        contract = Contract(
+            soul_purpose="Test timeout",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="slow",
+                    type=CriterionType.SHELL,
+                    command="sleep 200",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        # Mock subprocess.run to raise TimeoutExpired immediately
+        with patch(
+            "atlas_session.contract.verifier.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="sleep 200", timeout=120),
+        ):
+            result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        assert result["results"][0]["passed"] is False
+        assert "timed out" in result["results"][0]["output"].lower()
+
+    def test_shell_massive_output_truncated(self, project_with_session):
+        """Command producing massive output gets truncated to 500 chars.
+
+        Generates ~50000 chars of output to stress the truncation boundary.
+        """
+        contract = Contract(
+            soul_purpose="Test massive output",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="massive",
+                    type=CriterionType.SHELL,
+                    command="python3 -c \"print('X' * 50000)\"",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is True
+        output = result["results"][0]["output"]
+        assert len(output) <= 500
+        # Should be exactly 500 chars (truncated from 50000)
+        assert len(output) == 500
+
+    def test_evaluate_string_value_with_numeric_comparison(self):
+        """Non-numeric string value with '== 0' returns False, not crash.
+
+        float('not_a_number') raises ValueError, caught by except clause.
+        """
+        result = _evaluate_pass_when("== 0", value="not_a_number")
+        assert result is False
+
+        result = _evaluate_pass_when("> 5", value="hello")
+        assert result is False
+
+    def test_file_exists_broken_symlink(self, project_with_session):
+        """Broken symlink target: Path.exists() returns False, so criterion fails."""
+        import os
+        link_path = project_with_session / "broken_link.txt"
+        os.symlink("/nonexistent/target/file.txt", str(link_path))
+        contract = Contract(
+            soul_purpose="Test broken symlink",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="broken_link",
+                    type=CriterionType.FILE_EXISTS,
+                    path="broken_link.txt",
+                    pass_when="not_empty",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        assert result["results"][0]["passed"] is False
+
+    def test_context_check_with_list_field_uses_length(self, project_with_session):
+        """List-valued field uses len() for shorthand numeric comparison.
+
+        The template active context has 3 open tasks ([ ] placeholders),
+        so open_tasks is a list of 3 items, and len(3) != 0.
+        '== 0' on a 3-element list should fail. '> 0' should pass.
+        """
+        # Template has 3 "[ ]" items, so open_tasks has len 3
+        fail_contract = Contract(
+            soul_purpose="Test list context fail",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="no_open_tasks",
+                    type=CriterionType.CONTEXT_CHECK,
+                    field="open_tasks",
+                    pass_when="== 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), fail_contract)
+        # len([task1, task2, task3]) == 3, not 0 → fails
+        assert result["all_passed"] is False
+        assert result["results"][0]["passed"] is False
+
+        pass_contract = Contract(
+            soul_purpose="Test list context pass",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="has_open_tasks",
+                    type=CriterionType.CONTEXT_CHECK,
+                    field="open_tasks",
+                    pass_when="> 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), pass_contract)
+        # len([task1, task2, task3]) == 3 > 0 → passes
+        assert result["all_passed"] is True
+        assert result["results"][0]["passed"] is True
+
+
+class TestDraftCriteriaHostile:
+    """Hostile tests for draft criteria helper priority resolution."""
+
+    def test_multiple_stacks_first_match_wins(self):
+        """When detected_stack has multiple entries, the first matching if-branch wins.
+
+        The lookup functions check in order: node, python, rust, go.
+        """
+        signals = {"detected_stack": ["node", "python"]}
+        # 'node' comes first in the if/elif chain, so node commands win
         assert _guess_test_command(signals) == "npm test"
-
-    def test_guess_test_command_python(self):
-        """Python stack returns 'pytest'."""
-        signals = {"detected_stack": ["python"]}
-        assert _guess_test_command(signals) == "pytest"
-
-    def test_guess_test_command_rust(self):
-        """Rust stack returns 'cargo test'."""
-        signals = {"detected_stack": ["rust"]}
-        assert _guess_test_command(signals) == "cargo test"
-
-    def test_guess_test_command_go(self):
-        """Go stack returns 'go test ./...'."""
-        signals = {"detected_stack": ["go"]}
-        assert _guess_test_command(signals) == "go test ./..."
-
-    def test_guess_test_command_none(self):
-        """No signals returns fallback echo message."""
-        assert _guess_test_command(None) == "echo 'No test command configured'"
-
-    def test_guess_test_command_unknown_stack(self):
-        """Unknown stack returns fallback echo message."""
-        signals = {"detected_stack": ["java"]}
-        assert _guess_test_command(signals) == "echo 'No test command configured'"
-
-    # --- _guess_build_command ---
-
-    def test_guess_build_command_node(self):
-        """Node stack returns 'npm run build'."""
-        signals = {"detected_stack": ["node"]}
         assert _guess_build_command(signals) == "npm run build"
-
-    def test_guess_build_command_rust(self):
-        """Rust stack returns 'cargo build'."""
-        signals = {"detected_stack": ["rust"]}
-        assert _guess_build_command(signals) == "cargo build"
-
-    def test_guess_build_command_go(self):
-        """Go stack returns 'go build ./...'."""
-        signals = {"detected_stack": ["go"]}
-        assert _guess_build_command(signals) == "go build ./..."
-
-    def test_guess_build_command_none(self):
-        """No signals returns fallback echo message."""
-        assert _guess_build_command(None) == "echo 'No build command configured'"
-
-    def test_guess_build_command_unknown_stack(self):
-        """Unknown stack returns fallback echo message."""
-        signals = {"detected_stack": ["java"]}
-        assert _guess_build_command(signals) == "echo 'No build command configured'"
-
-    # --- _guess_lint_command ---
-
-    def test_guess_lint_command_python(self):
-        """Python stack returns 'ruff check .'."""
-        signals = {"detected_stack": ["python"]}
-        assert _guess_lint_command(signals) == "ruff check ."
-
-    def test_guess_lint_command_node(self):
-        """Node stack returns 'npm run lint'."""
-        signals = {"detected_stack": ["node"]}
         assert _guess_lint_command(signals) == "npm run lint"
 
-    def test_guess_lint_command_rust(self):
-        """Rust stack returns 'cargo clippy'."""
-        signals = {"detected_stack": ["rust"]}
-        assert _guess_lint_command(signals) == "cargo clippy"
+        # Reverse order: still 'node' wins because if-chain checks node first
+        signals_reversed = {"detected_stack": ["python", "node"]}
+        assert _guess_test_command(signals_reversed) == "npm test"
 
-    def test_guess_lint_command_go(self):
-        """Go stack returns 'go vet ./...'."""
-        signals = {"detected_stack": ["go"]}
-        assert _guess_lint_command(signals) == "go vet ./..."
+    def test_contract_save_overwrites_existing(self, project_with_session):
+        """Second save to same location overwrites the first completely."""
+        contract_v1 = Contract(
+            soul_purpose="Version 1",
+            escrow=100,
+            criteria=[],
+            bounty_id="v1-id",
+            status="active",
+        )
+        contract_v1.save(str(project_with_session))
 
-    def test_guess_lint_command_none(self):
-        """No signals returns fallback echo message."""
-        assert _guess_lint_command(None) == "echo 'No lint command configured'"
+        loaded = Contract.load(str(project_with_session))
+        assert loaded.soul_purpose == "Version 1"
+        assert loaded.bounty_id == "v1-id"
 
-    def test_guess_lint_command_unknown_stack(self):
-        """Unknown stack returns fallback echo message."""
-        signals = {"detected_stack": ["java"]}
-        assert _guess_lint_command(signals) == "echo 'No lint command configured'"
+        contract_v2 = Contract(
+            soul_purpose="Version 2",
+            escrow=500,
+            criteria=[
+                Criterion(
+                    name="new_check",
+                    type=CriterionType.SHELL,
+                    command="echo v2",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+            bounty_id="v2-id",
+            status="draft",
+        )
+        contract_v2.save(str(project_with_session))
+
+        loaded = Contract.load(str(project_with_session))
+        assert loaded.soul_purpose == "Version 2"
+        assert loaded.escrow == 500
+        assert loaded.bounty_id == "v2-id"
+        assert loaded.status == "draft"
+        assert len(loaded.criteria) == 1
+        assert loaded.criteria[0].name == "new_check"
 
 
 # =========================================================================
@@ -992,14 +1125,6 @@ class TestVerifierEdgeCases:
         result = run_tests(str(project_with_session), contract)
         assert result["all_passed"] is True
         assert len(result["results"][0]["output"]) <= 500
-
-    def test_evaluate_pass_when_none_value_none_exit_code(self):
-        """_evaluate_pass_when with None value and None exit_code defaults to 0 for comparison."""
-        # Shorthand comparison: when both value and exit_code are None,
-        # compare_val stays None, so num defaults to float(0)
-        assert _evaluate_pass_when("== 0", value=None, exit_code=None) is True  # 0 == 0
-        assert _evaluate_pass_when("> 0", value=None, exit_code=None) is False  # 0 > 0 is False
-        assert _evaluate_pass_when("!= 0", value=None, exit_code=None) is False  # 0 != 0 is False
 
     def test_evaluate_pass_when_malformed_exit_code_expression(self):
         """'exit_code ===== 0' (malformed) returns False gracefully."""

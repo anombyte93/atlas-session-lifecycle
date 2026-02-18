@@ -847,3 +847,207 @@ class TestEdgeCases:
         assert signals["has_readme"] is True
         # All non-blank lines start with # so content_lines should be empty
         assert signals["readme_excerpt"] == ""
+
+
+# =========================================================================
+# Hostile Tests — try to break session operations
+# =========================================================================
+
+
+class TestInitHostile:
+    """Hostile inputs that try to break init()."""
+
+    def test_init_with_empty_string_purpose(self, project_dir):
+        """init('') creates files but with a blank soul purpose.
+
+        The code does not validate that soul_purpose is non-empty;
+        it writes whatever string is provided.
+        """
+        result = init(str(project_dir), "")
+        assert result["status"] == "ok"
+        sp = (project_dir / "session-context" / "CLAUDE-soul-purpose.md").read_text()
+        # The soul purpose file has the heading and an empty body
+        assert sp == "# Soul Purpose\n\n\n"
+        ac = (project_dir / "session-context" / "CLAUDE-activeContext.md").read_text()
+        assert "**Current Goal**: " in ac
+
+    def test_init_unicode_purpose(self, project_dir):
+        """Unicode soul purpose (CJK + emoji) round-trips through init correctly."""
+        purpose = "\u6784\u5efa\u5c0f\u90e8\u4ef6\u5de5\u5382 \U0001f3ed"
+        result = init(str(project_dir), purpose)
+        assert result["status"] == "ok"
+        sp = (project_dir / "session-context" / "CLAUDE-soul-purpose.md").read_text()
+        assert purpose in sp
+        ac = (project_dir / "session-context" / "CLAUDE-activeContext.md").read_text()
+        assert purpose in ac
+
+
+class TestPreflightHostile:
+    """Hostile filesystem states that try to break preflight()."""
+
+    def test_preflight_with_broken_symlinks_in_root(self, project_dir):
+        """Broken symlinks in project root do not crash iterdir().
+
+        is_file() returns False for broken symlinks, so they are excluded
+        from root_file_count and don't appear in project_signals.
+        """
+        import os
+        os.symlink("/nonexistent/target", str(project_dir / "broken_link.txt"))
+        os.symlink("/also/nonexistent", str(project_dir / "another_broken.py"))
+        result = preflight(str(project_dir))
+        # Broken symlinks are not counted as files
+        assert result["root_file_count"] == 0
+        assert result["project_signals"]["is_empty_project"] is True
+
+
+class TestReadContextHostile:
+    """Hostile file content that tries to break read_context()."""
+
+    def test_read_context_when_active_context_is_binary_garbage(self, project_with_session):
+        """Binary garbage in CLAUDE-activeContext.md raises UnicodeDecodeError.
+
+        read_context does Path.read_text() with no error handling, so
+        invalid UTF-8 bytes crash the function.
+        """
+        ac_file = project_with_session / "session-context" / "CLAUDE-activeContext.md"
+        ac_file.write_bytes(b"\x80\x81\x82\xfe\xff\x00binary garbage\xff\xfe")
+        with pytest.raises(UnicodeDecodeError):
+            read_context(str(project_with_session))
+
+
+class TestArchiveHostile:
+    """Hostile input that tries to break archive()."""
+
+    def test_archive_when_purpose_contains_markdown_syntax(self, project_with_session):
+        """Purpose containing ## and [CLOSED] does not corrupt the archive.
+
+        The archive function writes the old purpose in a [CLOSED] block,
+        then checks for existing [CLOSED] entries. If the purpose text
+        itself contains '[CLOSED]', the code's string search may
+        inadvertently match and duplicate content.
+        """
+        sp_file = project_with_session / "session-context" / "CLAUDE-soul-purpose.md"
+        sp_file.write_text("# Soul Purpose\n\nBuild ## widgets [CLOSED] --- stuff\n")
+
+        result = archive(
+            str(project_with_session),
+            "Build ## widgets [CLOSED] --- stuff",
+            "Clean new purpose",
+        )
+        assert result["status"] == "ok"
+
+        content = sp_file.read_text()
+        # The new purpose should be at the top
+        assert content.startswith("# Soul Purpose\n\nClean new purpose\n")
+        # The old purpose should appear in a [CLOSED] block
+        assert "Build ## widgets [CLOSED] --- stuff" in content
+
+
+class TestHarvestHostile:
+    """Boundary tests for harvest()."""
+
+    def test_harvest_when_active_context_exactly_100_chars(self, project_with_session):
+        """Active context with exactly 100 stripped chars passes the threshold.
+
+        The check is `len(ac_content.strip()) < 100` — at 100, it's NOT < 100,
+        so harvest returns 'has_content'.
+        """
+        ac_file = project_with_session / "session-context" / "CLAUDE-activeContext.md"
+        # Create content that is exactly 100 chars after strip()
+        content = "A" * 100
+        assert len(content.strip()) == 100
+        ac_file.write_text(content)
+        result = harvest(str(project_with_session))
+        assert result["status"] == "has_content"
+
+    def test_harvest_when_active_context_99_chars(self, project_with_session):
+        """Active context with 99 stripped chars is below threshold.
+
+        len(99) < 100 is True, so harvest returns 'nothing'.
+        """
+        ac_file = project_with_session / "session-context" / "CLAUDE-activeContext.md"
+        content = "A" * 99
+        ac_file.write_text(content)
+        result = harvest(str(project_with_session))
+        assert result["status"] == "nothing"
+
+
+class TestHookActivateHostile:
+    """Concurrency test for hook_activate()."""
+
+    def test_hook_activate_overwrites_on_second_call(self, project_with_session):
+        """Two rapid hook_activate calls: second overwrites the first.
+
+        No locking mechanism exists. The second write wins.
+        """
+        result1 = hook_activate(str(project_with_session), "First purpose")
+        assert result1["status"] == "ok"
+
+        state_file = project_with_session / "session-context" / LIFECYCLE_STATE_FILENAME
+        state1 = json.loads(state_file.read_text())
+        assert state1["soul_purpose"] == "First purpose"
+
+        result2 = hook_activate(str(project_with_session), "Second purpose")
+        assert result2["status"] == "ok"
+
+        state2 = json.loads(state_file.read_text())
+        assert state2["soul_purpose"] == "Second purpose"
+        # First purpose is gone — overwritten, not merged
+        assert "First purpose" not in state_file.read_text()
+
+
+class TestClassifyBrainstormHostile:
+    """Hostile inputs for classify_brainstorm()."""
+
+    def test_classify_brainstorm_none_signals_crashes(self):
+        """Passing None as project_signals raises AttributeError.
+
+        The function does project_signals.get(...) which fails on None.
+        """
+        with pytest.raises(AttributeError):
+            classify_brainstorm("Build a thing now", None)
+
+    def test_classify_brainstorm_empty_dict_signals(self):
+        """Empty dict signals (no keys at all) returns 'full' weight."""
+        result = classify_brainstorm("go", {})
+        assert result["weight"] == "full"
+        assert result["has_content"] is False
+
+
+class TestCheckClutterHostile:
+    """Hostile filesystem states for check_clutter()."""
+
+    def test_check_clutter_hidden_dotfiles_are_whitelisted(self, project_dir):
+        """Hidden files (starting with .) are always whitelisted.
+
+        _is_whitelisted() returns True for any filename starting with '.',
+        but only files (not directories) are considered by check_clutter
+        since iterdir() filters with is_file().
+        """
+        (project_dir / ".hidden_config").write_text("secret=value")
+        (project_dir / ".another_hidden").write_text("data")
+        result = check_clutter(str(project_dir))
+        assert result["status"] == "clean"
+        assert result["whitelisted_count"] == 2
+        assert result["clutter_count"] == 0
+
+
+class TestFeaturesReadHostile:
+    """Hostile input for features_read()."""
+
+    def test_features_read_uppercase_X_checkbox(self, project_with_session):
+        """[X] (uppercase) is counted as verified because the code lowercases.
+
+        The code does `'[x]' in stripped.lower()` which matches both [x] and [X].
+        """
+        features_file = project_with_session / "session-context" / "CLAUDE-features.md"
+        features_file.write_text(
+            "# Features\n\n"
+            "- [X] Feature with uppercase X\n"
+            "- [x] Feature with lowercase x\n"
+            "- [ ] Pending feature\n"
+        )
+        result = features_read(str(project_with_session))
+        assert result["total"] == 3
+        assert result["counts"]["verified"] == 2  # Both [X] and [x]
+        assert result["counts"]["pending"] == 1

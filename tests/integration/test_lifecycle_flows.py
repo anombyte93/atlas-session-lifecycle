@@ -280,3 +280,101 @@ class TestGovernanceCacheRestoreCycle:
         # Cache file should be cleaned up
         from atlas_session.common.config import GOVERNANCE_CACHE_PATH
         assert not GOVERNANCE_CACHE_PATH.is_file()
+
+
+# ---------------------------------------------------------------------------
+# Hostile Integration Tests — try to break cross-cutting lifecycle flows
+# ---------------------------------------------------------------------------
+
+
+class TestInitArchiveReinitCycle:
+    """Hostile lifecycle: init -> archive -> init again.
+
+    Verifies that [CLOSED] history survives a full reinit cycle.
+    This is a real scenario: user finishes a purpose, archives, starts new one.
+    """
+
+    def test_closed_history_survives_reinit(self, project_dir):
+        """init -> archive -> init should preserve [CLOSED] entries.
+
+        After archive, soul purpose has [CLOSED] entries. After second init,
+        the soul purpose file is OVERWRITTEN with the new purpose (init copies
+        templates then writes fresh content). The [CLOSED] history is LOST.
+
+        This test documents the actual behavior: reinit destroys archive history.
+        """
+        pd = str(project_dir)
+
+        # Phase 1: First init
+        result = init(pd, "First project purpose")
+        assert result["status"] == "ok"
+
+        # Phase 2: Archive the first purpose
+        archive_result = archive(pd, "First project purpose", "Second purpose")
+        assert archive_result["status"] == "ok"
+
+        sp_file = project_dir / "session-context" / "CLAUDE-soul-purpose.md"
+        content_after_archive = sp_file.read_text()
+        assert "[CLOSED]" in content_after_archive
+        assert "First project purpose" in content_after_archive
+        assert "Second purpose" in content_after_archive
+
+        # Phase 3: Reinit (simulates a fresh /start on existing session)
+        result2 = init(pd, "Third project purpose")
+        assert result2["status"] == "ok"
+
+        # Verify: init overwrites the soul purpose file completely
+        content_after_reinit = sp_file.read_text()
+        assert "Third project purpose" in content_after_reinit
+        # The [CLOSED] history from Phase 2 is GONE because init
+        # writes a fresh "# Soul Purpose\n\n{purpose}\n"
+        assert "[CLOSED]" not in content_after_reinit
+        assert "First project purpose" not in content_after_reinit
+
+
+class TestGovernanceCacheRestoreUnicode:
+    """Hostile: CLAUDE.md with unicode content.
+
+    Verifies that cache/restore preserves CJK characters, emoji,
+    and special unicode in governance sections.
+    """
+
+    def test_unicode_governance_sections_round_trip(self, project_with_session):
+        """Unicode characters in CLAUDE.md survive cache -> wipe -> restore."""
+        cmd = project_with_session / "CLAUDE.md"
+        cmd.write_text(
+            "# CLAUDE.md\n\n"
+            "## Structure Maintenance Rules\n\n"
+            "\u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u306e\u69cb\u9020\u3092\u7dad\u6301\u3059\u308b\u3002 \U0001f4c2\n\n"
+            "## Session Context Files\n\n"
+            "\u30bb\u30c3\u30b7\u30e7\u30f3\u30b3\u30f3\u30c6\u30ad\u30b9\u30c8\u30d5\u30a1\u30a4\u30eb\u3002 \U0001f4dd\n\n"
+            "## IMMUTABLE TEMPLATE RULES\n\n"
+            "\u30c6\u30f3\u30d7\u30ec\u30fc\u30c8\u3092\u7de8\u96c6\u3057\u306a\u3044\u3067\u304f\u3060\u3055\u3044\u3002 \u26a0\ufe0f\n\n"
+            "## Ralph Loop\n\n"
+            "**Mode**: \u81ea\u52d5\n"
+            "**Intensity**: \u5f37\u529b \U0001f4aa\n"
+        )
+
+        pd = str(project_with_session)
+
+        # 1. Cache
+        cache_result = cache_governance(pd)
+        assert cache_result["status"] == "ok"
+        assert len(cache_result["cached_sections"]) >= 3
+
+        # 2. Wipe CLAUDE.md
+        cmd.write_text("# CLAUDE.md\n\nWiped clean.\n")
+
+        # 3. Restore
+        restore_result = restore_governance(pd)
+        assert restore_result["status"] == "ok"
+        assert len(restore_result["restored"]) >= 3
+
+        # 4. Verify unicode survived
+        restored_content = cmd.read_text()
+        assert "\u30d7\u30ed\u30b8\u30a7\u30af\u30c8" in restored_content  # "project" in Japanese
+        assert "\U0001f4c2" in restored_content  # folder emoji
+        assert "\U0001f4dd" in restored_content  # memo emoji
+        assert "\u26a0\ufe0f" in restored_content  # warning emoji
+        assert "\u81ea\u52d5" in restored_content  # "automatic" in Japanese
+        assert "\U0001f4aa" in restored_content  # flexed bicep emoji
