@@ -16,6 +16,24 @@ CACHE_FILE = ".license_cache"
 CACHE_TTL = 86400  # 24 hours
 
 
+def _touch_cache() -> None:
+    """Touch the cache file to mark license as freshly validated."""
+    cache_path = LICENSE_DIR / CACHE_FILE
+    cache_path.touch()
+
+
+def _get_customer_id() -> str | None:
+    """Read customer_id from license file if exists."""
+    license_path = LICENSE_DIR / LICENSE_FILE
+    if not license_path.exists():
+        return None
+    try:
+        data = json.loads(license_path.read_text())
+        return data.get("customer_id")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def activate_license(customer_id: str) -> dict:
     """Activate a license by writing customer_id to license.json."""
     LICENSE_DIR.mkdir(parents=True, exist_ok=True)
@@ -28,8 +46,7 @@ def activate_license(customer_id: str) -> dict:
     license_path.write_text(json.dumps(data, indent=2))
 
     # Touch cache to mark as freshly validated
-    cache_path = LICENSE_DIR / CACHE_FILE
-    cache_path.touch()
+    _touch_cache()
 
     return {"status": "ok", "customer_id": customer_id}
 
@@ -45,12 +62,18 @@ def revoke_license() -> dict:
     return {"status": "ok", "message": "License revoked."}
 
 
-def is_license_valid() -> bool:
+def is_license_valid(refresh: bool = True) -> bool:
     """Check if a valid, non-expired license exists locally.
 
     Returns True only if both license.json exists AND the cache
-    file is less than 24 hours old. When cache expires, the caller
-    should re-validate via Stripe API and touch the cache.
+    file is less than 24 hours old. When cache expires and refresh=True,
+    attempts to re-validate via Stripe API.
+
+    Args:
+        refresh: If True, try Stripe validation when cache expired.
+
+    Returns:
+        True if license is valid (locally or after Stripe refresh), False otherwise.
     """
     license_path = LICENSE_DIR / LICENSE_FILE
     cache_path = LICENSE_DIR / CACHE_FILE
@@ -59,14 +82,78 @@ def is_license_valid() -> bool:
         return False
 
     if not cache_path.exists():
+        # Cache missing - try to refresh if requested
+        if refresh:
+            return _try_refresh_from_stripe()
         return False
 
     # Check cache age
     cache_age = time.time() - cache_path.stat().st_mtime
     if cache_age > CACHE_TTL:
+        # Cache expired - try to refresh if requested
+        if refresh:
+            return _try_refresh_from_stripe()
         return False
 
     return True
+
+
+def _try_refresh_from_stripe() -> bool:
+    """Attempt to refresh license from Stripe API.
+
+    Returns True if validation succeeded and cache was touched,
+    False otherwise. Silently fails if Stripe is not configured.
+    """
+    customer_id = _get_customer_id()
+    if not customer_id:
+        return False
+
+    try:
+        from .stripe_client import validate_license_with_stripe
+
+        result = validate_license_with_stripe(customer_id)
+        if result.get("status") == "active":
+            _touch_cache()
+            return True
+    except Exception:
+        # Stripe not configured or API error - fail silently
+        pass
+
+    return False
+
+
+def refresh_license() -> dict:
+    """Manually refresh license from Stripe API.
+
+    Forces validation with Stripe regardless of cache age.
+    Useful when user wants to extend their license early.
+
+    Returns:
+        dict with status and validation result.
+    """
+    customer_id = _get_customer_id()
+    if not customer_id:
+        return {"status": "error", "message": "No local license found"}
+
+    try:
+        from .stripe_client import validate_license_with_stripe
+
+        result = validate_license_with_stripe(customer_id)
+        if result.get("status") == "active":
+            _touch_cache()
+            return {
+                "status": "ok",
+                "message": "License refreshed successfully",
+                "license_type": result.get("type"),
+            }
+        return {
+            "status": "inactive",
+            "message": result.get("message", "License not active in Stripe"),
+        }
+    except ImportError:
+        return {"status": "error", "message": "Stripe integration not available"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 def cli_main(argv: list[str] | None = None) -> int:
@@ -76,6 +163,7 @@ def cli_main(argv: list[str] | None = None) -> int:
         atlas-license activate <customer_id>
         atlas-license revoke
         atlas-license status
+        atlas-license refresh
     """
     import sys
 
@@ -83,7 +171,7 @@ def cli_main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
 
     if not argv:
-        print("Usage: atlas-license {activate,revoke,status}")
+        print("Usage: atlas-license {activate,revoke,status,refresh}")
         return 1
 
     command = argv[0]
@@ -108,6 +196,14 @@ def cli_main(argv: list[str] | None = None) -> int:
             print(f"License: VALID (customer: {data.get('customer_id', 'unknown')})")
             return 0
         print("License: INVALID or expired")
+        return 1
+
+    if command == "refresh":
+        result = refresh_license()
+        if result.get("status") == "ok":
+            print(f"License refreshed: {result.get('message', 'Success')}")
+            return 0
+        print(f"Refresh failed: {result.get('message', 'Unknown error')}")
         return 1
 
     print(f"Unknown command: {command}")

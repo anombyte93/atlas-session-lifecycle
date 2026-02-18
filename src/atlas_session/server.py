@@ -14,6 +14,7 @@ from fastmcp import FastMCP
 
 from .contract import tools as contract_tools
 from .session import tools as session_tools
+from .stripe import tools as stripe_tools
 
 mcp = FastMCP(
     "Atlas Session Lifecycle",
@@ -25,9 +26,10 @@ mcp = FastMCP(
     ),
 )
 
-# Register both domains
+# Register all domains
 session_tools.register(mcp)
 contract_tools.register(mcp)
+stripe_tools.register(mcp)
 
 
 def main():
