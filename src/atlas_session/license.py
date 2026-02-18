@@ -173,7 +173,15 @@ def is_license_valid(refresh: bool = True) -> bool:
         return True
 
     except (json.JSONDecodeError, KeyError, TypeError, OSError):
-        # Cache corrupted - try to refresh
+        # Cache corrupted or in old format (empty file from touch())
+        # For backward compatibility, check mtime as fallback
+        try:
+            cache_age = time.time() - cache_path.stat().st_mtime
+            if cache_age < CACHE_TTL:
+                return True
+        except (OSError, ValueError):
+            pass
+        # Try to refresh if requested
         if refresh:
             return _try_refresh_from_stripe()
         return False

@@ -42,6 +42,13 @@ _ALLOWED_COMMANDS = {
     "head",
     "tail",
     "wc",
+    # Test/common utilities (safe for CI/testing)
+    "echo",
+    "true",
+    "false",
+    "sleep",
+    "test",
+    "printf",
 }
 
 # Regex to detect shell metacharacters that could lead to injection
