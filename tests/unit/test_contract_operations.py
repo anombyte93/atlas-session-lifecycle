@@ -1,0 +1,938 @@
+"""Unit tests for contract model, verifier, AtlasCoin client, and draft criteria.
+
+Covers Tasks 5, 6, 7 of the test plan:
+  Task 5: Contract model and verifier (30 tests)
+  Task 6: AtlasCoin HTTP client mocked with respx (9 tests)
+  Task 7: Draft criteria helpers (8 tests)
+"""
+
+import json
+import subprocess
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+import pytest
+import respx
+
+from atlas_session.contract.model import Contract, Criterion, CriterionType
+from atlas_session.contract.verifier import _evaluate_pass_when, run_tests
+from atlas_session.contract import atlascoin
+from atlas_session.contract.tools import (
+    _guess_build_command,
+    _guess_lint_command,
+    _guess_test_command,
+)
+from atlas_session.common.config import ATLASCOIN_URL
+
+
+# =========================================================================
+# Task 5 — Contract Model and Verifier
+# =========================================================================
+
+
+class TestCriterionModel:
+    """Tests for Criterion dataclass and from_dict/to_dict."""
+
+    def test_from_dict_shell(self):
+        """Shell criterion round-trips through from_dict correctly."""
+        data = {
+            "name": "tests_pass",
+            "type": "shell",
+            "command": "pytest",
+            "pass_when": "exit_code == 0",
+            "weight": 2.0,
+        }
+        c = Criterion.from_dict(data)
+        assert c.name == "tests_pass"
+        assert c.type == CriterionType.SHELL
+        assert c.command == "pytest"
+        assert c.pass_when == "exit_code == 0"
+        assert c.weight == 2.0
+
+    def test_from_dict_context_check(self):
+        """Context check criterion parses field correctly."""
+        data = {
+            "name": "no_open_tasks",
+            "type": "context_check",
+            "field": "open_tasks",
+            "pass_when": "== 0",
+            "weight": 1.0,
+        }
+        c = Criterion.from_dict(data)
+        assert c.type == CriterionType.CONTEXT_CHECK
+        assert c.field == "open_tasks"
+
+    def test_from_dict_file_exists(self):
+        """File exists criterion parses path correctly."""
+        data = {
+            "name": "readme_exists",
+            "type": "file_exists",
+            "path": "README.md",
+            "pass_when": "not_empty",
+            "weight": 0.5,
+        }
+        c = Criterion.from_dict(data)
+        assert c.type == CriterionType.FILE_EXISTS
+        assert c.path == "README.md"
+
+    def test_from_dict_git_check(self):
+        """Git check criterion parses command correctly."""
+        data = {
+            "name": "has_commits",
+            "type": "git_check",
+            "command": "git log --oneline -1",
+            "pass_when": "exit_code == 0",
+            "weight": 1.0,
+        }
+        c = Criterion.from_dict(data)
+        assert c.type == CriterionType.GIT_CHECK
+        assert c.command == "git log --oneline -1"
+
+    def test_round_trip(self):
+        """to_dict -> from_dict produces equivalent Criterion."""
+        original = Criterion(
+            name="test_lint",
+            type=CriterionType.SHELL,
+            pass_when="exit_code == 0",
+            command="ruff check .",
+            weight=1.5,
+        )
+        restored = Criterion.from_dict(original.to_dict())
+        assert restored.name == original.name
+        assert restored.type == original.type
+        assert restored.command == original.command
+        assert restored.pass_when == original.pass_when
+        assert restored.weight == original.weight
+
+    def test_invalid_type_raises(self):
+        """from_dict raises ValueError for unknown criterion type."""
+        data = {
+            "name": "bad",
+            "type": "unknown_type",
+            "pass_when": "exit_code == 0",
+            "weight": 1.0,
+        }
+        with pytest.raises(ValueError):
+            Criterion.from_dict(data)
+
+    def test_to_dict_stores_type_as_string(self):
+        """to_dict stores CriterionType as its string value."""
+        c = Criterion(
+            name="check",
+            type=CriterionType.SHELL,
+            pass_when="exit_code == 0",
+        )
+        d = c.to_dict()
+        assert d["type"] == "shell"
+        assert isinstance(d["type"], str)
+
+
+class TestContractModel:
+    """Tests for Contract dataclass, persistence, and status lifecycle."""
+
+    def test_save_and_load(self, project_with_session):
+        """Contract saves to contract.json and loads back identically."""
+        contract = Contract(
+            soul_purpose="Build widget factory",
+            escrow=200,
+            criteria=[
+                Criterion(
+                    name="tests_pass",
+                    type=CriterionType.SHELL,
+                    pass_when="exit_code == 0",
+                    command="echo ok",
+                    weight=2.0,
+                ),
+            ],
+            bounty_id="abc-123",
+            status="active",
+        )
+        contract.save(str(project_with_session))
+
+        loaded = Contract.load(str(project_with_session))
+        assert loaded is not None
+        assert loaded.soul_purpose == "Build widget factory"
+        assert loaded.escrow == 200
+        assert loaded.bounty_id == "abc-123"
+        assert loaded.status == "active"
+        assert len(loaded.criteria) == 1
+        assert loaded.criteria[0].name == "tests_pass"
+        assert loaded.criteria[0].type == CriterionType.SHELL
+
+    def test_load_returns_none_when_missing(self, project_with_session):
+        """Contract.load returns None when no contract.json exists."""
+        result = Contract.load(str(project_with_session))
+        assert result is None
+
+    def test_load_returns_none_on_corrupt_json(self, project_with_session):
+        """Contract.load returns None when contract.json is malformed."""
+        contract_path = project_with_session / "session-context" / "contract.json"
+        contract_path.write_text("{not valid json}")
+        result = Contract.load(str(project_with_session))
+        assert result is None
+
+    def test_status_lifecycle(self, project_with_session):
+        """Contract status progresses through expected lifecycle states."""
+        contract = Contract(
+            soul_purpose="Test lifecycle",
+            escrow=50,
+        )
+        assert contract.status == "draft"
+
+        contract.status = "active"
+        contract.save(str(project_with_session))
+        loaded = Contract.load(str(project_with_session))
+        assert loaded.status == "active"
+
+        contract.status = "submitted"
+        contract.save(str(project_with_session))
+        loaded = Contract.load(str(project_with_session))
+        assert loaded.status == "submitted"
+
+        contract.status = "verified"
+        contract.save(str(project_with_session))
+        loaded = Contract.load(str(project_with_session))
+        assert loaded.status == "verified"
+
+        contract.status = "settled"
+        contract.save(str(project_with_session))
+        loaded = Contract.load(str(project_with_session))
+        assert loaded.status == "settled"
+
+    def test_to_dict_serializable(self):
+        """Contract.to_dict returns JSON-serializable dictionary."""
+        contract = Contract(
+            soul_purpose="Serialize test",
+            escrow=100,
+            criteria=[
+                Criterion(
+                    name="check",
+                    type=CriterionType.FILE_EXISTS,
+                    pass_when="not_empty",
+                    path="README.md",
+                    weight=0.5,
+                ),
+            ],
+            bounty_id="xyz",
+            status="active",
+        )
+        d = contract.to_dict()
+        # Should be JSON-serializable without error
+        serialized = json.dumps(d)
+        assert isinstance(serialized, str)
+        # Verify structure
+        assert d["soul_purpose"] == "Serialize test"
+        assert d["escrow"] == 100
+        assert len(d["criteria"]) == 1
+        assert d["criteria"][0]["type"] == "file_exists"
+
+    def test_from_dict_with_sample(self, sample_contract_dict):
+        """Contract.from_dict parses the sample contract fixture correctly."""
+        contract = Contract.from_dict(sample_contract_dict)
+        assert contract.soul_purpose == "Build a widget factory"
+        assert contract.escrow == 100
+        assert len(contract.criteria) == 2
+        assert contract.criteria[0].type == CriterionType.SHELL
+        assert contract.criteria[1].type == CriterionType.FILE_EXISTS
+
+    def test_from_dict_empty_criteria(self):
+        """Contract.from_dict handles missing criteria list gracefully."""
+        data = {
+            "soul_purpose": "Test",
+            "escrow": 50,
+            "bounty_id": "",
+            "status": "draft",
+        }
+        contract = Contract.from_dict(data)
+        assert contract.criteria == []
+
+
+class TestEvaluatePassWhen:
+    """Tests for the _evaluate_pass_when() expression evaluator."""
+
+    def test_exit_code_equals_zero_passes(self):
+        """'exit_code == 0' passes when exit_code is 0."""
+        assert _evaluate_pass_when("exit_code == 0", exit_code=0) is True
+
+    def test_exit_code_equals_zero_fails(self):
+        """'exit_code == 0' fails when exit_code is 1."""
+        assert _evaluate_pass_when("exit_code == 0", exit_code=1) is False
+
+    def test_exit_code_not_equals_zero(self):
+        """'exit_code != 0' passes when exit_code is non-zero."""
+        assert _evaluate_pass_when("exit_code != 0", exit_code=1) is True
+        assert _evaluate_pass_when("exit_code != 0", exit_code=0) is False
+
+    def test_exit_code_none_returns_false(self):
+        """'exit_code == 0' returns False when exit_code is None."""
+        assert _evaluate_pass_when("exit_code == 0", exit_code=None) is False
+
+    def test_shorthand_equals_zero(self):
+        """'== 0' shorthand works with exit_code as fallback."""
+        assert _evaluate_pass_when("== 0", exit_code=0) is True
+        assert _evaluate_pass_when("== 0", exit_code=1) is False
+
+    def test_shorthand_greater_than_zero(self):
+        """> 0' passes when value is positive."""
+        assert _evaluate_pass_when("> 0", value=5) is True
+        assert _evaluate_pass_when("> 0", value=0) is False
+
+    def test_shorthand_less_than(self):
+        """'< 10' passes when value is less than 10."""
+        assert _evaluate_pass_when("< 10", value=5) is True
+        assert _evaluate_pass_when("< 10", value=10) is False
+
+    def test_not_empty_string(self):
+        """'not_empty' passes for non-empty string value."""
+        assert _evaluate_pass_when("not_empty", value="hello") is True
+        assert _evaluate_pass_when("not_empty", value="") is False
+
+    def test_not_empty_list(self):
+        """'not_empty' passes for non-empty list, fails for empty list."""
+        assert _evaluate_pass_when("not_empty", value=["a", "b"]) is True
+        assert _evaluate_pass_when("not_empty", value=[]) is False
+
+    def test_not_empty_dict(self):
+        """'not_empty' passes for non-empty dict, fails for empty dict."""
+        assert _evaluate_pass_when("not_empty", value={"k": "v"}) is True
+        assert _evaluate_pass_when("not_empty", value={}) is False
+
+    def test_not_empty_output_fallback(self):
+        """'not_empty' falls back to output when value is None."""
+        assert _evaluate_pass_when("not_empty", output="some output") is True
+        assert _evaluate_pass_when("not_empty", output="") is False
+
+    def test_contains_text_in_output(self):
+        """'contains:text' checks for substring in output."""
+        assert _evaluate_pass_when("contains:SUCCESS", output="Test SUCCESS done") is True
+        assert _evaluate_pass_when("contains:FAIL", output="Test SUCCESS done") is False
+
+    def test_contains_text_in_value(self):
+        """'contains:text' checks for substring in value when no output."""
+        assert _evaluate_pass_when("contains:widget", value="build widget factory") is True
+        assert _evaluate_pass_when("contains:missing", value="build widget factory") is False
+
+    def test_contains_returns_false_when_no_string(self):
+        """'contains:text' returns False when neither output nor string value."""
+        assert _evaluate_pass_when("contains:text", value=42) is False
+        assert _evaluate_pass_when("contains:text") is False
+
+    def test_list_uses_length_for_shorthand(self):
+        """Shorthand numeric comparison uses len() for list values."""
+        assert _evaluate_pass_when("== 0", value=[]) is True
+        assert _evaluate_pass_when("> 0", value=["a"]) is True
+        assert _evaluate_pass_when("== 3", value=[1, 2, 3]) is True
+
+    def test_shorthand_greater_equal(self):
+        """>= 2' passes when value is at least 2."""
+        assert _evaluate_pass_when(">= 2", value=2) is True
+        assert _evaluate_pass_when(">= 2", value=1) is False
+
+    def test_shorthand_less_equal(self):
+        """'<= 5' passes when value is at most 5."""
+        assert _evaluate_pass_when("<= 5", value=5) is True
+        assert _evaluate_pass_when("<= 5", value=6) is False
+
+    def test_shorthand_not_equals(self):
+        """'!= 0' passes when value is non-zero."""
+        assert _evaluate_pass_when("!= 0", value=1) is True
+        assert _evaluate_pass_when("!= 0", value=0) is False
+
+    def test_unrecognized_expression_returns_false(self):
+        """Unrecognized pass_when expressions return False."""
+        assert _evaluate_pass_when("garbage expression") is False
+
+
+class TestRunTests:
+    """Tests for the run_tests() function."""
+
+    def test_shell_passes(self, project_with_session):
+        """Shell criterion passes when command succeeds."""
+        contract = Contract(
+            soul_purpose="Test shell",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="echo_test",
+                    type=CriterionType.SHELL,
+                    command="echo hello",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is True
+        assert result["results"][0]["passed"] is True
+        assert result["score"] == 100.0
+
+    def test_shell_fails(self, project_with_session):
+        """Shell criterion fails when command returns non-zero."""
+        contract = Contract(
+            soul_purpose="Test shell fail",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="false_cmd",
+                    type=CriterionType.SHELL,
+                    command="false",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        assert result["results"][0]["passed"] is False
+
+    def test_file_exists_passes(self, project_with_session):
+        """File exists criterion passes when file is present and non-empty."""
+        contract = Contract(
+            soul_purpose="Test file",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="active_ctx",
+                    type=CriterionType.FILE_EXISTS,
+                    path="session-context/CLAUDE-activeContext.md",
+                    pass_when="not_empty",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is True
+        assert result["results"][0]["passed"] is True
+
+    def test_file_missing_fails(self, project_with_session):
+        """File exists criterion fails when file is missing."""
+        contract = Contract(
+            soul_purpose="Test file missing",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="nonexistent",
+                    type=CriterionType.FILE_EXISTS,
+                    path="does-not-exist.txt",
+                    pass_when="not_empty",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        assert result["results"][0]["passed"] is False
+        assert "missing" in result["results"][0]["output"]
+
+    def test_weighted_scoring(self, project_with_session):
+        """Score respects criterion weights: passing criteria earn their weight."""
+        contract = Contract(
+            soul_purpose="Test weights",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="passes",
+                    type=CriterionType.SHELL,
+                    command="true",
+                    pass_when="exit_code == 0",
+                    weight=3.0,
+                ),
+                Criterion(
+                    name="fails",
+                    type=CriterionType.SHELL,
+                    command="false",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        # 3.0 out of 4.0 total weight = 75%
+        assert result["score"] == 75.0
+
+    def test_summary_format(self, project_with_session):
+        """Summary contains 'N/M criteria passed (P%)'."""
+        contract = Contract(
+            soul_purpose="Test summary",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="passes",
+                    type=CriterionType.SHELL,
+                    command="true",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+                Criterion(
+                    name="also_passes",
+                    type=CriterionType.SHELL,
+                    command="true",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert "2/2 criteria passed" in result["summary"]
+        assert "100%" in result["summary"]
+
+    def test_context_check_criterion(self, project_with_soul_purpose):
+        """Context check criterion evaluates read_context field correctly."""
+        contract = Contract(
+            soul_purpose="Test context",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="has_purpose",
+                    type=CriterionType.CONTEXT_CHECK,
+                    field="soul_purpose",
+                    pass_when="not_empty",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_soul_purpose), contract)
+        assert result["all_passed"] is True
+        assert result["results"][0]["passed"] is True
+        assert "soul_purpose" in result["results"][0]["output"]
+
+    def test_context_check_missing_field(self, project_with_session):
+        """Context check returns false when field is not found."""
+        contract = Contract(
+            soul_purpose="Test missing field",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="check_fake",
+                    type=CriterionType.CONTEXT_CHECK,
+                    field="nonexistent_field",
+                    pass_when="not_empty",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        assert "not found" in result["results"][0]["output"]
+
+    def test_git_check_in_git_repo(self, project_with_git):
+        """Git check criterion uses shell runner on git commands."""
+        contract = Contract(
+            soul_purpose="Test git",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="has_commits",
+                    type=CriterionType.GIT_CHECK,
+                    command="git log --oneline -1",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_git), contract)
+        assert result["all_passed"] is True
+        assert result["results"][0]["passed"] is True
+
+    def test_git_check_fails_in_non_git(self, project_with_session):
+        """Git check criterion fails in a non-git directory."""
+        contract = Contract(
+            soul_purpose="Test git fail",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="has_commits",
+                    type=CriterionType.GIT_CHECK,
+                    command="git log --oneline -1",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        assert result["results"][0]["passed"] is False
+
+    def test_shell_no_command_fails(self, project_with_session):
+        """Shell criterion with empty command fails with descriptive output."""
+        contract = Contract(
+            soul_purpose="Test no cmd",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="empty_cmd",
+                    type=CriterionType.SHELL,
+                    command="",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        assert "No command" in result["results"][0]["output"]
+
+    def test_empty_criteria_list(self, project_with_session):
+        """Contract with no criteria returns all_passed=True and score=0."""
+        contract = Contract(
+            soul_purpose="Test empty",
+            escrow=50,
+            criteria=[],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is True
+        assert result["score"] == 0
+        assert result["results"] == []
+
+    def test_file_exists_directory_not_empty(self, project_with_session):
+        """File exists with not_empty checks directory has contents."""
+        contract = Contract(
+            soul_purpose="Test dir",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="session_dir_notempty",
+                    type=CriterionType.FILE_EXISTS,
+                    path="session-context",
+                    pass_when="not_empty",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is True
+
+    def test_file_exists_simple_exists_check(self, project_with_session):
+        """File exists with non-not_empty pass_when only checks existence."""
+        # Create a file
+        (project_with_session / "test_file.txt").write_text("")
+        contract = Contract(
+            soul_purpose="Test exists",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="file_present",
+                    type=CriterionType.FILE_EXISTS,
+                    path="test_file.txt",
+                    pass_when="exit_code == 0",  # not 'not_empty', so just checks exists
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is True
+
+
+# =========================================================================
+# Task 6 — AtlasCoin HTTP Client (mocked with respx)
+# =========================================================================
+
+
+class TestAtlasCoinHealth:
+    """Tests for atlascoin.health() with mocked HTTP."""
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_healthy_200(self):
+        """Returns healthy=True on 200 with JSON content-type."""
+        respx.get(f"{ATLASCOIN_URL}/health").mock(
+            return_value=httpx.Response(
+                200,
+                json={"status": "ok"},
+                headers={"content-type": "application/json"},
+            )
+        )
+        result = await atlascoin.health()
+        assert result["healthy"] is True
+        assert result["url"] == ATLASCOIN_URL
+        assert result["data"] == {"status": "ok"}
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_unhealthy_500(self):
+        """Returns healthy=False on 500 status."""
+        respx.get(f"{ATLASCOIN_URL}/health").mock(
+            return_value=httpx.Response(500, text="Internal Server Error")
+        )
+        result = await atlascoin.health()
+        assert result["healthy"] is False
+        assert result["status_code"] == 500
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_connection_refused(self):
+        """Returns healthy=False with error on connection failure."""
+        respx.get(f"{ATLASCOIN_URL}/health").mock(
+            side_effect=httpx.ConnectError("Connection refused")
+        )
+        result = await atlascoin.health()
+        assert result["healthy"] is False
+        assert "error" in result
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_healthy_non_json_content_type(self):
+        """Returns empty data dict when content-type is not JSON."""
+        respx.get(f"{ATLASCOIN_URL}/health").mock(
+            return_value=httpx.Response(
+                200,
+                text="OK",
+                headers={"content-type": "text/plain"},
+            )
+        )
+        result = await atlascoin.health()
+        assert result["healthy"] is True
+        assert result["data"] == {}
+
+
+class TestAtlasCoinCreateBounty:
+    """Tests for atlascoin.create_bounty() with mocked HTTP."""
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_successful_201(self):
+        """Returns status=ok with data on 201."""
+        respx.post(f"{ATLASCOIN_URL}/api/bounties").mock(
+            return_value=httpx.Response(
+                201,
+                json={"id": "bounty-123", "escrowAmount": 100},
+            )
+        )
+        result = await atlascoin.create_bounty("Build a thing", 100)
+        assert result["status"] == "ok"
+        assert result["data"]["id"] == "bounty-123"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_api_error_400(self):
+        """Returns status=error on 400 with body text."""
+        respx.post(f"{ATLASCOIN_URL}/api/bounties").mock(
+            return_value=httpx.Response(400, text="Bad Request: invalid escrow")
+        )
+        result = await atlascoin.create_bounty("Build a thing", -1)
+        assert result["status"] == "error"
+        assert result["status_code"] == 400
+        assert "Bad Request" in result["body"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_connection_error(self):
+        """Returns status=error with error string on connection failure."""
+        respx.post(f"{ATLASCOIN_URL}/api/bounties").mock(
+            side_effect=httpx.ConnectError("Connection refused")
+        )
+        result = await atlascoin.create_bounty("Build a thing", 100)
+        assert result["status"] == "error"
+        assert "error" in result
+
+
+class TestAtlasCoinSubmitSolution:
+    """Tests for atlascoin.submit_solution() with mocked HTTP."""
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_successful_200(self):
+        """Returns status=ok on successful submission."""
+        respx.post(f"{ATLASCOIN_URL}/api/bounties/bounty-123/submit").mock(
+            return_value=httpx.Response(
+                200,
+                json={"submitted": True, "claimId": "claim-456"},
+            )
+        )
+        result = await atlascoin.submit_solution(
+            "bounty-123", 10, {"soul_purpose": "test"}
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["submitted"] is True
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_submit_error(self):
+        """Returns status=error on non-success status code."""
+        respx.post(f"{ATLASCOIN_URL}/api/bounties/bounty-123/submit").mock(
+            return_value=httpx.Response(422, text="Unprocessable Entity")
+        )
+        result = await atlascoin.submit_solution(
+            "bounty-123", 10, {"soul_purpose": "test"}
+        )
+        assert result["status"] == "error"
+        assert result["status_code"] == 422
+
+
+class TestAtlasCoinVerify:
+    """Tests for atlascoin.verify_bounty() with mocked HTTP."""
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_successful_200(self):
+        """Returns status=ok on successful verification."""
+        respx.post(f"{ATLASCOIN_URL}/api/bounties/bounty-123/verify").mock(
+            return_value=httpx.Response(
+                200,
+                json={"verified": True},
+            )
+        )
+        result = await atlascoin.verify_bounty(
+            "bounty-123", {"passed": True, "score": 100}
+        )
+        assert result["status"] == "ok"
+        assert result["data"]["verified"] is True
+
+
+class TestAtlasCoinSettle:
+    """Tests for atlascoin.settle_bounty() with mocked HTTP."""
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_successful_200(self):
+        """Returns status=ok on successful settlement."""
+        respx.post(f"{ATLASCOIN_URL}/api/bounties/bounty-123/settle").mock(
+            return_value=httpx.Response(
+                200,
+                json={"settled": True, "tokens": 100},
+            )
+        )
+        result = await atlascoin.settle_bounty("bounty-123")
+        assert result["status"] == "ok"
+        assert result["data"]["settled"] is True
+        assert result["data"]["tokens"] == 100
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_error_404(self):
+        """Returns status=error on 404 (bounty not found)."""
+        respx.post(f"{ATLASCOIN_URL}/api/bounties/nonexistent/settle").mock(
+            return_value=httpx.Response(404, text="Not Found")
+        )
+        result = await atlascoin.settle_bounty("nonexistent")
+        assert result["status"] == "error"
+        assert result["status_code"] == 404
+        assert "Not Found" in result["body"]
+
+
+class TestAtlasCoinGetBounty:
+    """Tests for atlascoin.get_bounty() with mocked HTTP."""
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_successful_200(self):
+        """Returns status=ok with bounty data on 200."""
+        respx.get(f"{ATLASCOIN_URL}/api/bounties/bounty-123").mock(
+            return_value=httpx.Response(
+                200,
+                json={"id": "bounty-123", "status": "active"},
+            )
+        )
+        result = await atlascoin.get_bounty("bounty-123")
+        assert result["status"] == "ok"
+        assert result["data"]["id"] == "bounty-123"
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_not_found_404(self):
+        """Returns status=error on 404."""
+        respx.get(f"{ATLASCOIN_URL}/api/bounties/missing").mock(
+            return_value=httpx.Response(404, text="Not Found")
+        )
+        result = await atlascoin.get_bounty("missing")
+        assert result["status"] == "error"
+        assert result["status_code"] == 404
+
+
+# =========================================================================
+# Task 7 — Draft Criteria Helpers
+# =========================================================================
+
+
+class TestDraftCriteriaHelpers:
+    """Tests for _guess_test_command, _guess_build_command, _guess_lint_command."""
+
+    # --- _guess_test_command ---
+
+    def test_guess_test_command_node(self):
+        """Node stack returns 'npm test'."""
+        signals = {"detected_stack": ["node"]}
+        assert _guess_test_command(signals) == "npm test"
+
+    def test_guess_test_command_python(self):
+        """Python stack returns 'pytest'."""
+        signals = {"detected_stack": ["python"]}
+        assert _guess_test_command(signals) == "pytest"
+
+    def test_guess_test_command_rust(self):
+        """Rust stack returns 'cargo test'."""
+        signals = {"detected_stack": ["rust"]}
+        assert _guess_test_command(signals) == "cargo test"
+
+    def test_guess_test_command_go(self):
+        """Go stack returns 'go test ./...'."""
+        signals = {"detected_stack": ["go"]}
+        assert _guess_test_command(signals) == "go test ./..."
+
+    def test_guess_test_command_none(self):
+        """No signals returns fallback echo message."""
+        assert _guess_test_command(None) == "echo 'No test command configured'"
+
+    def test_guess_test_command_unknown_stack(self):
+        """Unknown stack returns fallback echo message."""
+        signals = {"detected_stack": ["java"]}
+        assert _guess_test_command(signals) == "echo 'No test command configured'"
+
+    # --- _guess_build_command ---
+
+    def test_guess_build_command_node(self):
+        """Node stack returns 'npm run build'."""
+        signals = {"detected_stack": ["node"]}
+        assert _guess_build_command(signals) == "npm run build"
+
+    def test_guess_build_command_rust(self):
+        """Rust stack returns 'cargo build'."""
+        signals = {"detected_stack": ["rust"]}
+        assert _guess_build_command(signals) == "cargo build"
+
+    def test_guess_build_command_go(self):
+        """Go stack returns 'go build ./...'."""
+        signals = {"detected_stack": ["go"]}
+        assert _guess_build_command(signals) == "go build ./..."
+
+    def test_guess_build_command_none(self):
+        """No signals returns fallback echo message."""
+        assert _guess_build_command(None) == "echo 'No build command configured'"
+
+    def test_guess_build_command_unknown_stack(self):
+        """Unknown stack returns fallback echo message."""
+        signals = {"detected_stack": ["java"]}
+        assert _guess_build_command(signals) == "echo 'No build command configured'"
+
+    # --- _guess_lint_command ---
+
+    def test_guess_lint_command_python(self):
+        """Python stack returns 'ruff check .'."""
+        signals = {"detected_stack": ["python"]}
+        assert _guess_lint_command(signals) == "ruff check ."
+
+    def test_guess_lint_command_node(self):
+        """Node stack returns 'npm run lint'."""
+        signals = {"detected_stack": ["node"]}
+        assert _guess_lint_command(signals) == "npm run lint"
+
+    def test_guess_lint_command_rust(self):
+        """Rust stack returns 'cargo clippy'."""
+        signals = {"detected_stack": ["rust"]}
+        assert _guess_lint_command(signals) == "cargo clippy"
+
+    def test_guess_lint_command_go(self):
+        """Go stack returns 'go vet ./...'."""
+        signals = {"detected_stack": ["go"]}
+        assert _guess_lint_command(signals) == "go vet ./..."
+
+    def test_guess_lint_command_none(self):
+        """No signals returns fallback echo message."""
+        assert _guess_lint_command(None) == "echo 'No lint command configured'"
+
+    def test_guess_lint_command_unknown_stack(self):
+        """Unknown stack returns fallback echo message."""
+        signals = {"detected_stack": ["java"]}
+        assert _guess_lint_command(signals) == "echo 'No lint command configured'"

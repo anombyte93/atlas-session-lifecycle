@@ -17,5 +17,16 @@ dependencies = [
 [project.scripts]
 atlas-session = "atlas_session.server:main"
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "respx>=0.22",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
