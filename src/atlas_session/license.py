@@ -67,3 +67,59 @@ def is_license_valid() -> bool:
         return False
 
     return True
+
+
+def cli_main(argv: list[str] | None = None) -> int:
+    """CLI entry point for license management.
+
+    Usage:
+        atlas-license activate <customer_id>
+        atlas-license revoke
+        atlas-license status
+    """
+    import sys
+
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if not argv:
+        print("Usage: atlas-license {activate,revoke,status}")
+        return 1
+
+    command = argv[0]
+
+    if command == "activate":
+        if len(argv) < 2:
+            print("Usage: atlas-license activate <customer_id>")
+            return 1
+        result = activate_license(argv[1])
+        print(f"License activated for {result['customer_id']}")
+        return 0
+
+    if command == "revoke":
+        revoke_license()
+        print("License revoked.")
+        return 0
+
+    if command == "status":
+        if is_license_valid():
+            license_path = LICENSE_DIR / LICENSE_FILE
+            data = json.loads(license_path.read_text())
+            print(f"License: VALID (customer: {data.get('customer_id', 'unknown')})")
+            return 0
+        print("License: INVALID or expired")
+        return 1
+
+    print(f"Unknown command: {command}")
+    return 1
+
+
+def _cli_entry() -> None:
+    """Entry point for project.scripts — wraps cli_main with sys.exit."""
+    import sys
+
+    sys.exit(cli_main())
+
+
+if __name__ == "__main__":
+    _cli_entry()

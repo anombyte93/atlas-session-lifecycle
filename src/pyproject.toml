@@ -29,6 +29,7 @@ dependencies = [
 
 [project.scripts]
 atlas-session = "atlas_session.server:main"
+atlas-license = "atlas_session.license:_cli_entry"
 
 [project.urls]
 Homepage = "https://github.com/anombyte93/atlas-session-lifecycle"

@@ -137,3 +137,73 @@ class TestLicenseValidation:
 
         # No cache file = needs validation = returns False
         assert is_license_valid() is False
+
+
+class TestLicenseCLI:
+    """Tests for the atlas-license CLI entry point."""
+
+    def test_cli_activate(self, tmp_path, monkeypatch):
+        """atlas-license activate <customer_id> writes license file."""
+        license_dir = tmp_path / ".atlas-session"
+        monkeypatch.setattr("atlas_session.license.LICENSE_DIR", license_dir)
+
+        from atlas_session.license import cli_main
+
+        exit_code = cli_main(["activate", "cus_test123"])
+        assert exit_code == 0
+        assert (license_dir / "license.json").exists()
+        data = json.loads((license_dir / "license.json").read_text())
+        assert data["customer_id"] == "cus_test123"
+
+    def test_cli_revoke(self, tmp_path, monkeypatch):
+        """atlas-license revoke removes license."""
+        license_dir = tmp_path / ".atlas-session"
+        license_dir.mkdir()
+        (license_dir / "license.json").write_text('{"customer_id": "x"}')
+        (license_dir / ".license_cache").touch()
+        monkeypatch.setattr("atlas_session.license.LICENSE_DIR", license_dir)
+
+        from atlas_session.license import cli_main
+
+        exit_code = cli_main(["revoke"])
+        assert exit_code == 0
+        assert not (license_dir / "license.json").exists()
+
+    def test_cli_status_valid(self, tmp_path, monkeypatch):
+        """atlas-license status shows valid when license is fresh."""
+        license_dir = tmp_path / ".atlas-session"
+        license_dir.mkdir()
+        (license_dir / "license.json").write_text(
+            json.dumps({"customer_id": "cus_xyz", "activated_at": time.time()})
+        )
+        (license_dir / ".license_cache").touch()
+        monkeypatch.setattr("atlas_session.license.LICENSE_DIR", license_dir)
+
+        from atlas_session.license import cli_main
+
+        exit_code = cli_main(["status"])
+        assert exit_code == 0
+
+    def test_cli_status_invalid(self, tmp_path, monkeypatch):
+        """atlas-license status returns 1 when no license."""
+        license_dir = tmp_path / ".atlas-session"
+        monkeypatch.setattr("atlas_session.license.LICENSE_DIR", license_dir)
+
+        from atlas_session.license import cli_main
+
+        exit_code = cli_main(["status"])
+        assert exit_code == 1
+
+    def test_cli_no_args(self):
+        """atlas-license with no args returns 1."""
+        from atlas_session.license import cli_main
+
+        exit_code = cli_main([])
+        assert exit_code == 1
+
+    def test_cli_activate_missing_customer_id(self):
+        """atlas-license activate without customer_id returns 1."""
+        from atlas_session.license import cli_main
+
+        exit_code = cli_main(["activate"])
+        assert exit_code == 1
