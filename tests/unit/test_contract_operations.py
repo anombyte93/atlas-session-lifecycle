@@ -936,3 +936,138 @@ class TestDraftCriteriaHelpers:
         """Unknown stack returns fallback echo message."""
         signals = {"detected_stack": ["java"]}
         assert _guess_lint_command(signals) == "echo 'No lint command configured'"
+
+
+# =========================================================================
+# Edge Cases — verifier coverage gaps
+# =========================================================================
+
+
+class TestVerifierEdgeCases:
+    """Edge cases in verifier and pass_when evaluator."""
+
+    def test_run_tests_zero_total_weight(self, project_with_session):
+        """All criteria with weight=0 should produce score=0, not a division error."""
+        contract = Contract(
+            soul_purpose="Test zero weight",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="zero_a",
+                    type=CriterionType.SHELL,
+                    command="true",
+                    pass_when="exit_code == 0",
+                    weight=0.0,
+                ),
+                Criterion(
+                    name="zero_b",
+                    type=CriterionType.SHELL,
+                    command="true",
+                    pass_when="exit_code == 0",
+                    weight=0.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["score"] == 0
+        assert result["all_passed"] is True
+        # Should not raise ZeroDivisionError
+
+    def test_shell_output_truncation(self, project_with_session):
+        """Shell command output > 500 chars is truncated to 500."""
+        # Generate output well over 500 characters
+        contract = Contract(
+            soul_purpose="Test truncation",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="long_output",
+                    type=CriterionType.SHELL,
+                    command="python3 -c \"print('A' * 1000)\"",
+                    pass_when="exit_code == 0",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is True
+        assert len(result["results"][0]["output"]) <= 500
+
+    def test_evaluate_pass_when_none_value_none_exit_code(self):
+        """_evaluate_pass_when with None value and None exit_code defaults to 0 for comparison."""
+        # Shorthand comparison: when both value and exit_code are None,
+        # compare_val stays None, so num defaults to float(0)
+        assert _evaluate_pass_when("== 0", value=None, exit_code=None) is True  # 0 == 0
+        assert _evaluate_pass_when("> 0", value=None, exit_code=None) is False  # 0 > 0 is False
+        assert _evaluate_pass_when("!= 0", value=None, exit_code=None) is False  # 0 != 0 is False
+
+    def test_evaluate_pass_when_malformed_exit_code_expression(self):
+        """'exit_code ===== 0' (malformed) returns False gracefully."""
+        assert _evaluate_pass_when("exit_code ===== 0", exit_code=0) is False
+
+    def test_file_exists_non_not_empty_on_missing_file(self, project_with_session):
+        """file_exists with pass_when != 'not_empty' on missing file fails."""
+        contract = Contract(
+            soul_purpose="Test missing exists",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="missing_file",
+                    type=CriterionType.FILE_EXISTS,
+                    path="totally-missing.txt",
+                    pass_when="exit_code == 0",  # not 'not_empty'
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        assert result["results"][0]["passed"] is False
+        assert "missing" in result["results"][0]["output"]
+
+    def test_file_exists_empty_dir_not_empty(self, project_with_session):
+        """file_exists on empty directory with not_empty fails."""
+        empty_dir = project_with_session / "empty_dir"
+        empty_dir.mkdir()
+        contract = Contract(
+            soul_purpose="Test empty dir",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="empty_dir_check",
+                    type=CriterionType.FILE_EXISTS,
+                    path="empty_dir",
+                    pass_when="not_empty",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        assert result["results"][0]["passed"] is False
+
+    def test_context_check_missing_field(self, project_with_session):
+        """context_check with a field not in read_context returns passed=False with 'not found'."""
+        contract = Contract(
+            soul_purpose="Test missing field edge",
+            escrow=50,
+            criteria=[
+                Criterion(
+                    name="check_nonexistent",
+                    type=CriterionType.CONTEXT_CHECK,
+                    field="completely_fake_field",
+                    pass_when="not_empty",
+                    weight=1.0,
+                ),
+            ],
+        )
+        result = run_tests(str(project_with_session), contract)
+        assert result["all_passed"] is False
+        assert result["results"][0]["passed"] is False
+        assert "not found" in result["results"][0]["output"]
+
+    def test_contains_no_matching_text(self):
+        """'contains:' with no matching text in output returns False."""
+        assert _evaluate_pass_when("contains:NEEDLE", output="haystack without match") is False
+        assert _evaluate_pass_when("contains:NEEDLE", value="haystack without match") is False
+        assert _evaluate_pass_when("contains:NEEDLE", output="", value="") is False

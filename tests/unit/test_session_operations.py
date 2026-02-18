@@ -759,3 +759,91 @@ class TestGitSummary:
         assert len(result["files_changed"]) >= 1
         files = [f["file"] for f in result["files_changed"]]
         assert "new_file.txt" in files
+
+
+# =========================================================================
+# Edge Cases — coverage gap tests
+# =========================================================================
+
+
+class TestEdgeCases:
+    """Edge cases and error branches for coverage gaps."""
+
+    def test_read_context_literal_no_active_soul_purpose(self, project_with_session):
+        """read_context with literal '(No active soul purpose)' returns status_hint='no_purpose'."""
+        sp_file = project_with_session / "session-context" / "CLAUDE-soul-purpose.md"
+        sp_file.write_text("# Soul Purpose\n\n(No active soul purpose)\n")
+        result = read_context(str(project_with_session))
+        assert result["soul_purpose"] == ""
+        assert result["status_hint"] == "no_purpose"
+
+    def test_archive_with_multiple_closed_entries(self, project_with_session):
+        """archive preserves existing [CLOSED] entries when archiving again."""
+        sp_file = project_with_session / "session-context" / "CLAUDE-soul-purpose.md"
+        # Set up a file with two existing [CLOSED] entries
+        sp_file.write_text(
+            "# Soul Purpose\n\n"
+            "Current active purpose\n\n"
+            "---\n\n"
+            "## [CLOSED] \u2014 2026-02-15\n\n"
+            "Second old purpose\n\n"
+            "## [CLOSED] \u2014 2026-02-10\n\n"
+            "First old purpose\n"
+        )
+        result = archive(str(project_with_session), "Current active purpose", "Brand new purpose")
+        assert result["status"] == "ok"
+
+        content = sp_file.read_text()
+        # New purpose at top
+        assert "Brand new purpose" in content
+        # The newly archived purpose should be present
+        assert "Current active purpose" in content
+        # Both old [CLOSED] entries should still be present
+        assert "2026-02-15" in content
+        assert "Second old purpose" in content
+        assert "2026-02-10" in content
+        assert "First old purpose" in content
+        # Count [CLOSED] markers — should be at least 3 (newly archived + 2 old)
+        closed_count = content.count("[CLOSED]")
+        assert closed_count >= 3
+
+    def test_check_clutter_uncategorized_extensions(self, project_dir):
+        """Files with unusual extensions (.xyz, .dat) go to 'docs/archive'."""
+        (project_dir / "data.xyz").write_text("xyz content")
+        (project_dir / "report.dat").write_text("dat content")
+        result = check_clutter(str(project_dir))
+        assert result["status"] == "cluttered"
+        assert result["clutter_count"] >= 2
+        # Verify they are categorized as uncategorized -> docs/archive
+        for item in result["moves"]:
+            if item["file"] in ("data.xyz", "report.dat"):
+                assert item["target"].startswith("docs/archive/")
+                assert item["category"] == "uncategorized"
+
+    def test_git_summary_no_tracking_branch(self, project_with_session):
+        """git_summary with no remote tracking branch returns ahead=0 and behind=0."""
+        import subprocess
+        proj = project_with_session
+        subprocess.run(["git", "init"], cwd=proj, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=proj, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=proj, capture_output=True)
+        (proj / "file.txt").write_text("hello")
+        subprocess.run(["git", "add", "."], cwd=proj, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=proj, capture_output=True)
+        # No remote set, so HEAD...@{upstream} will fail
+        result = git_summary(str(proj))
+        assert result["is_git"] is True
+        assert result["ahead"] == 0
+        assert result["behind"] == 0
+
+    def test_preflight_with_large_unusual_readme(self, project_dir):
+        """preflight handles README with only headings, no content lines."""
+        # README with only headings and empty lines — readme_excerpt should be empty
+        (project_dir / "README.md").write_text(
+            "# Title\n\n## Section One\n\n## Section Two\n\n### Subsection\n"
+        )
+        result = preflight(str(project_dir))
+        signals = result["project_signals"]
+        assert signals["has_readme"] is True
+        # All non-blank lines start with # so content_lines should be empty
+        assert signals["readme_excerpt"] == ""
