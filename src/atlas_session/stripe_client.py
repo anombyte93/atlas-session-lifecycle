@@ -14,10 +14,6 @@ from pathlib import Path
 _STRIPE_IMPORTED = False
 stripe = None  # type: ignore[assignment]
 
-# Price IDs (will be loaded from env or use defaults)
-PRICE_MONTHLY_ID = os.getenv("STRIPE_PRICE_MONTHLY_ID", "")
-PRICE_YEARLY_ID = os.getenv("STRIPE_PRICE_YEARLY_ID", "")
-
 # License directory (shared with license.py)
 LICENSE_DIR = Path.home() / ".atlas-session"
 LICENSE_FILE = "license.json"
@@ -35,6 +31,13 @@ class StripeSignatureError(RuntimeError):
     """Raised when webhook signature verification fails."""
 
     pass
+
+
+def _get_price_id(mode: str) -> str:
+    """Get price ID from environment for given mode."""
+    if mode == "payment":
+        return os.getenv("STRIPE_PRICE_YEARLY_ID", "")
+    return os.getenv("STRIPE_PRICE_MONTHLY_ID", "")
 
 
 def _ensure_stripe() -> None:
@@ -86,7 +89,7 @@ def create_checkout_session(
     """
     _ensure_stripe()
 
-    price_id = PRICE_YEARLY_ID if mode == "payment" else PRICE_MONTHLY_ID
+    price_id = _get_price_id(mode)
 
     if not price_id:
         raise StripeNotConfigured(
