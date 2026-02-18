@@ -121,6 +121,13 @@ Skill(skill: "ralph-go", args: "DERIVED_SOUL_PURPOSE")
 >
 > **UX**: Everything in Steps 1-2 is invisible to the user. First visible interaction is a question (Step 3) or seamless work continuation (Step 4).
 
+## Step 0: Sync Previous State
+
+Before any assessment, save the current session state so context files reflect reality:
+
+1. Invoke `/sync` — updates all session-context files and MEMORY.md with current progress.
+2. This is silent — no output shown to user.
+
 ## Step 1: Silent Assessment + Context Reality Check
 
 1. Call `session_validate(project_dir)` — repair any missing session files.

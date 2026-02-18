@@ -26,9 +26,15 @@ All session operations use `atlas-session` MCP tools directly (prefixed `session
 
 ---
 
-## Phase 0: State Detection
+## Phase 0: Sync + State Detection
 
-1. Call `session_read_context(project_dir)` — get soul purpose, status hint, open tasks.
+First, save the current session state so context files are up to date:
+
+1. Invoke `/sync` — updates all session-context files and MEMORY.md with current progress. Silent, no output shown.
+
+Then detect state:
+
+2. Call `session_read_context(project_dir)` — get soul purpose, status hint, open tasks.
 2. If `status_hint` is `no_purpose` or soul purpose is empty: tell user "No active soul purpose to close." **EXIT**.
 3. Check bounty: if `session-context/BOUNTY_ID.txt` exists, call `contract_get_status(project_dir)`. Store `HAS_BOUNTY`.
 
