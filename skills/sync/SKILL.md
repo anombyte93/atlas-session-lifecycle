@@ -1,6 +1,6 @@
 ---
 name: sync
-description: "Fast save-point: sync all session-context files and MEMORY.md with current progress. Zero questions, zero delay. Use when user says /sync, save progress, save state, or sync context."
+description: "Fast save-point: sync all session-context files and MEMORY.md with current progress. Zero questions, zero delay. Use when user says /sync, save progress, save state, sync context, or /sync --full for capability inventory."
 user-invocable: true
 ---
 
@@ -85,4 +85,29 @@ Synced. {N} files updated.
 - Patterns: {count new or "no new"}
 - Troubleshooting: {count new or "no new"}
 - Memory: {updated or "no changes"}
+```
+
+---
+
+## /sync --full (Capability Inventory)
+
+> Extended sync that includes capability inventory generation.
+
+### Execute
+
+1. Run standard sync flow (Steps 1-5 above).
+2. Call `session_capability_inventory(project_dir, force_refresh=True)` — bypasses cache and regenerates inventory even if git unchanged.
+3. If `needs_generation == True`: the MCP tool will generate the inventory.
+4. Read `CLAUDE-capability-inventory.md` if it exists.
+
+### Print summary
+
+Print the standard sync block above, plus:
+
+```
+Capability Inventory: {status}
+- MCP Tools: {count}
+- Test Coverage: {percentage}
+- Critical Untested: {count}
+- Inventory: {path}
 ```

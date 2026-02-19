@@ -126,6 +126,48 @@ class TestSessionToolsViaMCP:
         assert "message" in data["commits"][0]
         assert data["commits"][0]["message"] == "initial"
 
+    async def test_capability_inventory_via_mcp(self, mcp_client, project_with_git):
+        """Call session_capability_inventory, verify cache and structure."""
+        # First call should create cache (cache_hit=False)
+        result1 = await mcp_client.call_tool(
+            "session_capability_inventory",
+            {"project_dir": str(project_with_git)},
+        )
+        data1 = result1.data
+
+        assert data1["status"] == "ok"
+        assert data1["is_git"] is True
+        assert "git_head" in data1
+        assert isinstance(data1["git_head"], str)
+        assert len(data1["git_head"]) > 0
+        assert data1["cache_hit"] is False
+        assert data1["needs_generation"] is True
+        assert "inventory_file" in data1
+
+        # Second call should hit cache (cache_hit=True)
+        result2 = await mcp_client.call_tool(
+            "session_capability_inventory",
+            {"project_dir": str(project_with_git)},
+        )
+        data2 = result2.data
+
+        assert data2["status"] == "ok"
+        assert data2["git_head"] == data1["git_head"]
+        assert data2["cache_hit"] is True
+        assert data2["needs_generation"] is False
+        assert data2["git_changed"] is False
+
+        # Force refresh should bypass cache
+        result3 = await mcp_client.call_tool(
+            "session_capability_inventory",
+            {"project_dir": str(project_with_git), "force_refresh": True},
+        )
+        data3 = result3.data
+
+        assert data3["status"] == "ok"
+        assert data3["cache_hit"] is False
+        assert data3["needs_generation"] is True
+
 
 # ---------------------------------------------------------------------------
 # TestContractToolsViaMCP

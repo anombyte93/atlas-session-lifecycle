@@ -29,6 +29,10 @@ from ..common.state import (
     session_dir,
 )
 
+# Capability inventory cache constants
+CAPABILITY_CACHE_FILENAME = ".capability-cache.json"
+CAPABILITY_INVENTORY_FILENAME = "CLAUDE-capability-inventory.md"
+
 
 def _resolve_project_dir(project_dir: str) -> Path:
     """Resolve and validate project_dir to prevent path traversal.
@@ -981,3 +985,124 @@ def git_summary(project_dir: str) -> dict:
         result["behind"] = int(parts[1])
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# capability_inventory
+# ---------------------------------------------------------------------------
+
+
+def _get_git_head(project_dir: str) -> str | None:
+    """Get current git HEAD commit hash.
+
+    Returns:
+        Commit hash as string, or None if not a git repo or command fails.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return None
+
+
+def _get_capability_cache_path(project_dir: str) -> Path:
+    """Get path to capability cache file.
+
+    Returns:
+        Path object for session-context/.capability-cache.json
+    """
+    return session_dir(project_dir) / CAPABILITY_CACHE_FILENAME
+
+
+def _load_capability_cache(project_dir: str) -> dict | None:
+    """Load capability cache from disk.
+
+    Returns:
+        Cached data dict, or None if file doesn't exist or invalid JSON.
+    """
+    cache_path = _get_capability_cache_path(project_dir)
+    if not cache_path.is_file():
+        return None
+
+    try:
+        content = cache_path.read_text()
+        return json.loads(content)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_capability_cache(project_dir: str, data: dict) -> None:
+    """Save capability cache to disk.
+
+    Args:
+        project_dir: Project directory path
+        data: Cache data to write as indented JSON
+    """
+    cache_path = _get_capability_cache_path(project_dir)
+    cache_path.parent.mkdir(exist_ok=True)
+    cache_path.write_text(json.dumps(data, indent=2))
+
+
+def capability_inventory(project_dir: str, force_refresh: bool = False) -> dict:
+    """Manage capability inventory cache with git-aware invalidation.
+
+    The cache stores metadata about the capability inventory file and is
+    invalidated when the git HEAD changes, ensuring freshness after commits.
+
+    Args:
+        project_dir: Project directory path
+        force_refresh: If True, bypass cache and force regeneration
+
+    Returns:
+        Dict with:
+            - status: "ok"
+            - cache_hit: bool (True if cache was valid and used)
+            - is_git: bool (True if project is a git repo)
+            - git_head: str | None (current commit hash)
+            - git_changed: bool (True if HEAD changed since cache)
+            - inventory_file: str (relative path to inventory file)
+            - needs_generation: bool (True if inventory should be regenerated)
+    """
+    git_head = _get_git_head(project_dir)
+    is_git = git_head is not None
+
+    # Load existing cache if in git repo
+    cache = _load_capability_cache(project_dir) if is_git else None
+
+    cache_hit = False
+    git_changed = False
+    cached_head = None
+
+    if cache:
+        cached_head = cache.get("git_head")
+        cache_hit = cached_head == git_head and not force_refresh
+        git_changed = cached_head != git_head
+
+    # Save new cache entry if not hitting or forcing refresh (git repos only)
+    if is_git and (not cache_hit or force_refresh):
+        cache_data = {
+            "git_head": git_head,
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _save_capability_cache(project_dir, cache_data)
+
+    # Relative path from session-context
+    inventory_file = f"session-context/{CAPABILITY_INVENTORY_FILENAME}"
+
+    return {
+        "status": "ok",
+        "cache_hit": cache_hit,
+        "is_git": is_git,
+        "git_head": git_head,
+        "git_changed": git_changed,
+        "inventory_file": inventory_file,
+        "needs_generation": not cache_hit or force_refresh,
+    }

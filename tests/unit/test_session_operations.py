@@ -15,6 +15,7 @@ from pathlib import Path
 from atlas_session.session.operations import (
     archive,
     cache_governance,
+    capability_inventory,
     check_clutter,
     classify_brainstorm,
     ensure_governance,
@@ -1126,3 +1127,118 @@ class TestFeaturesReadHostile:
         assert result["total"] == 3
         assert result["counts"]["verified"] == 2  # Both [X] and [x]
         assert result["counts"]["pending"] == 1
+
+
+# =========================================================================
+# capability_inventory — cache operations for capability inventory
+# =========================================================================
+
+
+class TestCapabilityInventory:
+    """Tests for the capability_inventory() function."""
+
+    def test_capability_inventory_creates_cache_on_first_run(self, project_with_git):
+        """First call should create cache file."""
+        import subprocess
+
+        cache_file = project_with_git / "session-context" / ".capability-cache.json"
+
+        # Ensure cache doesn't exist initially
+        cache_file.unlink(missing_ok=True)
+
+        result = capability_inventory(str(project_with_git))
+
+        assert result["status"] == "ok"
+        assert result["is_git"] is True
+        assert result["git_head"] is not None
+        assert result["cache_hit"] is False
+        assert result["needs_generation"] is True
+        assert cache_file.is_file()
+
+        # Verify cache contents
+        cache = json.loads(cache_file.read_text())
+        assert "git_head" in cache
+        assert cache["git_head"] == result["git_head"]
+        assert "cached_at" in cache
+
+    def test_capability_inventory_returns_cache_on_subsequent_calls(
+        self, project_with_git
+    ):
+        """Same git HEAD = cache hit."""
+        import subprocess
+
+        result1 = capability_inventory(str(project_with_git))
+        first_head = result1["git_head"]
+
+        # Second call with same git HEAD should hit cache
+        result2 = capability_inventory(str(project_with_git))
+
+        assert result2["status"] == "ok"
+        assert result2["is_git"] is True
+        assert result2["git_head"] == first_head
+        assert result2["cache_hit"] is True
+        assert result2["git_changed"] is False
+        assert result2["needs_generation"] is False
+        assert result2["inventory_file"] == "session-context/CLAUDE-capability-inventory.md"
+
+    def test_capability_inventory_invalidates_on_git_change(self, project_with_git):
+        """Different HEAD = regenerate."""
+        import subprocess
+
+        # First call
+        result1 = capability_inventory(str(project_with_git))
+        first_head = result1["git_head"]
+
+        # Make a new commit to change HEAD
+        (project_with_git / "newfile.txt").write_text("content")
+        subprocess.run(["git", "add", "."], cwd=project_with_git, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "new commit"],
+            cwd=project_with_git,
+            capture_output=True,
+        )
+
+        # Second call should detect git change
+        result2 = capability_inventory(str(project_with_git))
+
+        assert result2["status"] == "ok"
+        assert result2["is_git"] is True
+        assert result2["git_head"] != first_head
+        assert result2["cache_hit"] is False
+        assert result2["git_changed"] is True
+        assert result2["needs_generation"] is True
+
+    def test_capability_inventory_handles_non_git(self, project_with_session):
+        """Non-git projects always regenerate."""
+        result = capability_inventory(str(project_with_session))
+
+        assert result["status"] == "ok"
+        assert result["is_git"] is False
+        assert result["git_head"] is None
+        assert result["cache_hit"] is False
+        assert result["git_changed"] is False
+        assert result["needs_generation"] is True
+        assert result["inventory_file"] == "session-context/CLAUDE-capability-inventory.md"
+
+        # No cache file should be created for non-git projects
+        cache_file = project_with_session / "session-context" / ".capability-cache.json"
+        assert not cache_file.is_file()
+
+    def test_capability_inventory_force_refresh(self, project_with_git):
+        """force_refresh=True bypasses cache."""
+        import subprocess
+
+        # First call to create cache
+        result1 = capability_inventory(str(project_with_git))
+        assert result1["cache_hit"] is False
+
+        # Second call without force_refresh should hit cache
+        result2 = capability_inventory(str(project_with_git), force_refresh=False)
+        assert result2["cache_hit"] is True
+        assert result2["needs_generation"] is False
+
+        # Third call with force_refresh should bypass cache
+        result3 = capability_inventory(str(project_with_git), force_refresh=True)
+        assert result3["cache_hit"] is False
+        assert result3["needs_generation"] is True
+        assert result3["git_changed"] is False  # git didn't change, just forced refresh

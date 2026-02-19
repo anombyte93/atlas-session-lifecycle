@@ -137,8 +137,12 @@ Before any assessment, save the current session state so context files reflect r
 5. Call `session_read_context(project_dir)` — get soul purpose, open tasks, Ralph config, status hint.
 6. Call `session_git_summary(project_dir)` — get recent commits, changed files, branch state.
 7. **Compare** `read_context` against `git_summary`: if context is stale (commits exist that aren't reflected in active context), update `session-context/CLAUDE-activeContext.md` with real progress.
-8. Check bounty: if `session-context/BOUNTY_ID.txt` exists, call `contract_get_status(project_dir)`.
-9. Read `custom.md` if it exists, follow instructions under "During Reconcile".
+8. Check capability inventory: call `session_capability_inventory(project_dir)`.
+   - If `cache_hit == True` and `git_changed == False`: inventory is current.
+   - If `needs_generation == True`: inventory requires generation. The MCP tool returns `inventory_path` when ready.
+9. Read `CLAUDE-capability-inventory.md` if it exists. Extract untested code, security claims, and feature claims with gaps.
+10. Check bounty: if `session-context/BOUNTY_ID.txt` exists, call `contract_get_status(project_dir)`.
+11. Read `custom.md` if it exists, follow instructions under "During Reconcile".
 
 ### Root Cleanup
 
