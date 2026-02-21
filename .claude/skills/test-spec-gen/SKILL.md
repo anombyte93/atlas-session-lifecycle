@@ -127,11 +127,11 @@ If user declines:
 ### MCP Discovery Commands
 
 ```bash
-# List available MCP tools
-mcp-cli list 2>/dev/null || echo "mcp-cli not installed"
+# Check MCP config directly
+grep -E "perplexity|context7|playwright|trello" ~/.claude/mcp_config.json 2>/dev/null && echo "MCP servers configured" || echo "Some MCP servers missing"
 
-# Check for specific servers
-mcp-cli server list | grep -E "(perplexity|context7|playwright|trello)" || echo "Some MCP servers missing"
+# Alternative: check ~/.claude.json (Claude Code's actual registry)
+grep -E "perplexity|context7|playwright|trello" ~/.claude.json 2>/dev/null | grep -q "mcp" && echo "MCP servers registered" || echo "Some MCP servers missing"
 ```
 
 ## Phase 1: Codebase Discovery (5 Parallel Agents)
@@ -529,7 +529,7 @@ Following Anthropic's testing practices, implement two-layer verification.
 
 ```
 Task(
-  subagent_type: "doubt-agent",
+  subagent_type: "general-purpose",
   model: "sonnet",
   description: "Review test spec for maintenance burden",
   prompt: `You are a doubt agent reviewing a generated test specification.

@@ -1,0 +1,52 @@
+# Architecture Decisions
+
+## 07:08 19/02/26
+Security-first architecture decisions:
+
+1. **HMAC-signed license tokens**: Moved from mtime-based cache to HMAC-signed tokens to prevent trivial bypass via `touch()`. Uses customer_id + expiry as message payload with SHA-256 HMAC.
+
+2. **Command allowlist**: Contract shell commands now restricted to allowlist (git, python3, npm, etc.) to prevent arbitrary command execution via MCP tool parameters.
+
+3. **Path resolution validation**: All project_dir parameters resolved through Path.resolve() to prevent `../` traversal attacks.
+
+4. **Installer commit pinning**: Git clones now use specific commit hashes instead of `main` HEAD for reproducible, verifiable installations.
+
+5. **Semver validation**: GitHub API responses validated with regex before use in python3 -c to prevent shell injection.
+
+6. **Secure tempfile**: Replaced predictable /tmp filename with tempfile.NamedTemporaryFile for random, unlink-on-close behavior.
+
+7. **Stripe webhook docs**: Added SECURITY documentation emphasizing raw byte-exact requirement for HMAC verification.
+
+## 10:55 19/02/26
+
+8. **Capability inventory as cached MCP tool**: Implemented as `session_capability_inventory` MCP tool with git HEAD-based cache invalidation. Cache stored in `session-context/.capability-cache.json`. Non-git projects always regenerate. Design keeps the MCP tool responsible for cache logic while the skill layer (SKILL.md) decides when to invoke.
+
+9. **MCP server registration via CLI not JSON**: Discovered Claude Code uses `~/.claude.json` (via `claude mcp add`), NOT `~/.claude/mcp_config.json`. The latter is ignored. Always use `claude mcp add -s user` for global scope, `-s local` for project scope.
+
+10. **Perplexity MCP server as dedicated private repo**: Moved from `/opt/perplexity/` to `/home/anombyte/Hermes/Projects/perplexity-mcp-server` with proper git tracking, main/develop branching, and one-shot install script.
+
+## 15:44 19/02/26
+
+11. **Atlas-Copilot positioning vs SaaS competitors**: Differentiated on self-hosted, free (BYO API key), no vendor lock-in. CodeRabbit ($12-24/user/mo) and Graphite ($20-40/user/mo) are SaaS with code sent to external infrastructure. Atlas-Copilot runs in user's GitHub with their own Anthropic API key — code never leaves their infrastructure.
+
+12. **CI/CD scaffold detection "just works"**: Integrated into /start Init Step 3 with smart skip logic — only prompts when: code files exist, package manifest present, no existing CI. Skips simple scripts, toy projects, and projects with CI. Follows "zero friction" UX principle.
+
+13. **Phase tracking via hooks for statusline display**: Created `phase-tracker.sh` hook that tracks /start and atlas-session operation phases. Statusline shows `[phase]` in color-coded brackets (lavender for /start, sapphire for session). Auto-clears after 5 seconds to prevent stale display.
+
+## 21:09 19/02/26
+
+14. **Ralph Loop vs quick-clarify separation**: Ralph Loop is for iterative development (self-referential, fed same prompt repeatedly). quick-clarify is a pre-work brainstorming skill (3 questions: deliverable, done criteria, size). Converted ralph-go → quick-clarify to avoid confusion — Ralph is now purely invoked via `/ralph-loop` command, not through skill questions.
+
+15. **Web dashboard tech stack: FastAPI + HTMX + TailwindCSS**: Chose for Atlas Session Dashboard because FastAPI is already the MCP server framework, HTMX enables server-driven UI without complex JavaScript, and TailwindCSS provides rapid styling. All Python, no build step, perfect for internal admin tooling.
+
+## 21:29 19/02/26
+
+16. **Hook precedence is deterministic (alphabetical plugin load order)**: Claude Code executes hooks in plugin registration order. First hook to exit 0 allows the action — subsequent hooks never run. This means if hookify registers a Stop hook that exits 0, Ralph Loop's Stop hook never gets to block termination.
+
+17. **Lifecycle hooks must be exclusive or explicitly ordered**: When multiple plugins register the same lifecycle hook, execution order matters. A permissive early hook shadows restrictive later hooks. Solution: either single Stop broker plugin or explicit priority config.
+
+## 11:30 21/02/26
+
+18. **MCP CLI is archived and redundant**: The mcp-cli tool referenced in test-spec-gen skill is no longer maintained. MCP tool discovery should use ToolSearch (built-in to Claude Code) or direct file reads (~/.claude/mcp_config.json or ~/.claude.json). All mcp-cli references must be removed.
+
+19. **Subagent types are validated at runtime**: "doubt-agent" is not a valid subagent_type for Task tool. Valid types are: Explore, general-purpose, Plan, etc. For custom agent behavior, use subagent_type="general-purpose" with a prompt that specifies the role.
