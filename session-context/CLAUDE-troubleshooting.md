@@ -175,4 +175,24 @@ Task(
 
 **Solution**: Use semantic references instead (Phase X section, YAML frontmatter block). Accept that some fragility remains for structural tests, but prioritize behavior-over-structure assertions where possible.
 
+## 11:53 21/02/26
+
+### Failure counter directory creation race condition
+
+**Problem**: soul-loop-stop.sh tried to write to .soul-loop-failures before ensuring session-context directory exists. Script failed with "No such file or directory."
+
+**Solution**: Add `mkdir -p "$(dirname "$FAILURE_COUNTER")"` before first write. Also check if file exists before `wc -l` to avoid errors.
+
+### Completion promise not detected in transcript JSON
+
+**Problem**: grep '"role":"assistant"' failed to find entries because JSON formats vary (compact vs pretty-printed, quote styles).
+
+**Solution**: Try multiple patterns in sequence: strict grep for compact JSON, fallback to grep 'assistant', fallback to jq selector. This handles various JSON formatting styles.
+
+### Hook must allow exit when tests pass but promise not yet fulfilled
+
+**Problem**: Original logic only checked promise when TEST_STATUS=="pass", but projects without tests should also be able to exit via promise.
+
+**Solution**: Changed condition to `[[ "$TEST_STATUS" == "pass" || "$TEST_STATUS" == "unknown" ]]` — allow promise-based exit for both passing and no-test scenarios.
+
 

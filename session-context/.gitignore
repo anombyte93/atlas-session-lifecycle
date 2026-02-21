@@ -1,0 +1,8 @@
+# Session state files (don't track)
+.session-active.json
+lifecycle-active.json
+.soul-loop-failures
+capability-cache.json
+
+# DO track knowledge files
+!CLAUDE-*.md

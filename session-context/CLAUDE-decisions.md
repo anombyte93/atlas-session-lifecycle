@@ -62,3 +62,8 @@ Security-first architecture decisions:
 23. **Circular testing paradox acknowledged**: Meta self-testing of a test generation skill creates circular validation (testing doubt agents with doubt agents). This is inherent to dogfooding and must be acknowledged as a limitation, not "solved."
 24. **Semantic vs absolute references for maintainability**: Doubt agent identified line number references as high-maintenance (65% invalidation rate). Migration to semantic references (Phase X section vs line Y) reduces fragility when SKILL.md is edited.
 
+## 11:53 21/02/26
+25. **Soul Loop plugin as separate backpressure enforcement system**: Created soul-loop as a separate plugin (not part of soul-purpose skill) to enable independent lifecycle and reusability. Uses state file at session-context/soul-loop-state.md with YAML frontmatter for iteration tracking.
+26. **Hierarchical gate design for backpressure**: Critical (hard block: max iterations, corruption, 10+ failures), Quality (soft warning: test failures, feature proof failures), Progressive (friction: 5+ failures warn, 10+ hard stop), Agentic (allow exit: completion promise matched). This follows Huntley's "Engineering Backpressure" — deterministic first (90%), agentic second (10%).
+27. **Promise tag for graceful loop termination**: User outputs `<promise>EXACT_TEXT</promise>` to exit soul loop early. Hook scans transcript JSON for matching promise tag. Enables human-controlled completion condition within enforced iteration constraints.
+

@@ -109,3 +109,8 @@ echo "RALPH STOP FIRED $(date)" >> ~/.claude/hook-debug.log
 18. **Template-based document assembly**: Load test-spec.md template → Replace simple placeholders ({PROJECT_NAME}, {DATE}) → Insert complex outputs ({SPECIALIST_OUTPUTS}) → Generate traceability matrix → Save to output path.
 19. **Fallback domain pattern**: When research doesn't yield 5 test domains, use fallback: UI Component Testing, User Flow Testing, Error Handling & Edge Cases, Data Integrity & CRUD, Access Control & Security.
 
+## 11:53 21/02/26
+20. **Soul loop stop hook pattern**: Hook reads state file → checks critical gates (max iterations, corruption) → runs quality gates (tests, feature proofs) → checks progressive gate (5 warn, 10 stop) → checks agentic gate (promise tag) → either allows exit or blocks with continuation prompt. Updates iteration counter at end of each turn.
+21. **Progressive friction implementation**: Use simple line-count failure counter (one line per failure). Check with `wc -l`. At 5 failures, warn user. At 10 failures, hard stop. This creates increasing friction without blocking legitimate debugging.
+22. **Promise tag detection in transcripts**: Greedy search through transcript JSON for `<promise>PROMISE_TEXT</promise>` tag. Try multiple grep patterns since JSON formats vary (compact vs pretty-printed). Allow exit only on exact match with configured completion_promise.
+
