@@ -50,3 +50,15 @@ Security-first architecture decisions:
 18. **MCP CLI is archived and redundant**: The mcp-cli tool referenced in test-spec-gen skill is no longer maintained. MCP tool discovery should use ToolSearch (built-in to Claude Code) or direct file reads (~/.claude/mcp_config.json or ~/.claude.json). All mcp-cli references must be removed.
 
 19. **Subagent types are validated at runtime**: "doubt-agent" is not a valid subagent_type for Task tool. Valid types are: Explore, general-purpose, Plan, etc. For custom agent behavior, use subagent_type="general-purpose" with a prompt that specifies the role.
+
+## 12:06 21/02/26
+
+20. **Soul-purpose skill as backpressure enforcement system**: The skill itself is the backpressure layer — it ensures deterministic constraints (types, linting, tests, CI/CD) are in place before AI begins generating output. /start bootstraps the enforcement system, /stop verifies through deterministic gates before agentic review.
+
+21. **Deterministic first, agentic second for soul loop**: Following Huntley's backpressure pyramid, soul loop should enforce deterministic gates (max iterations, state validation, feature proofs, test suite) before agentic gates (completion promise, soul purpose fulfillment). 90% of problems caught by deterministic checks, 10% by judgment.
+
+## 20:24 21/02/26
+22. **Meta self-test validation via adapted domains**: When applying test-spec-gen to itself (a skill, not a web app), the standard discovery domains (Routes, Auth, Database, Framework, UX) are not applicable. Adapted domains are: Skill Discovery & Configuration, Agent Orchestration & Parallel Execution, Research Integration & Domain Determination, Test Specification Generation & Assembly, Verification & Integration.
+23. **Circular testing paradox acknowledged**: Meta self-testing of a test generation skill creates circular validation (testing doubt agents with doubt agents). This is inherent to dogfooding and must be acknowledged as a limitation, not "solved."
+24. **Semantic vs absolute references for maintainability**: Doubt agent identified line number references as high-maintenance (65% invalidation rate). Migration to semantic references (Phase X section vs line Y) reduces fragility when SKILL.md is edited.
+

@@ -98,3 +98,14 @@ echo "RALPH STOP FIRED $(date)" >> ~/.claude/hook-debug.log
 12. **MCP tool discovery via ToolSearch**: Instead of relying on external tools like mcp-cli (archived), use Claude Code's built-in ToolSearch tool to discover available MCP tools before using them.
 
 13. **Custom agent behavior via general-purpose**: To create "doubt-agent" or other custom agent behaviors, use `Task(subagent_type="general-purpose", prompt="You are a doubt-agent. [full instructions]")` instead of non-existent subagent_type values.
+
+14. **Backpressure gate hierarchy**: Deterministic gates (types → lint → unit tests → contract tests → integration → E2E) run first and are script-verifiable. Agentic gates (judgment-based review) run only after deterministic gates pass. This ensures AI output quality before human review.
+
+15. **Stop hook continuation pattern**: Hook reads transcript, checks state file, and either (a) allows exit or (b) outputs JSON `{"decision": "block", "reason": "prompt text", "systemMessage": "iteration info"}` to continue loop. This enables self-referential iteration where each loop sees previous work in files/git.
+
+## 20:24 21/02/26
+16. **Multi-agent orchestration for test specification**: 5 parallel Explore agents (routes, auth, data, framework, UX) → Research agent (perplexity/context7) → 5 parallel Specialist agents (one per domain) → Doubt agent → Finality agent. Total 13+ agents, 3 sequential phases with parallel execution within phases.
+17. **TC-XXX test case format**: Standardized test case format with Area, Priority, Preconditions, Test Steps, Expected Outcome, Pass Criteria, Notes. Used across all specialist outputs for consistency.
+18. **Template-based document assembly**: Load test-spec.md template → Replace simple placeholders ({PROJECT_NAME}, {DATE}) → Insert complex outputs ({SPECIALIST_OUTPUTS}) → Generate traceability matrix → Save to output path.
+19. **Fallback domain pattern**: When research doesn't yield 5 test domains, use fallback: UI Component Testing, User Flow Testing, Error Handling & Edge Cases, Data Integrity & CRUD, Access Control & Security.
+

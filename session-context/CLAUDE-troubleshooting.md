@@ -140,3 +140,39 @@ Task(
 **Problem**: test_spec_gen_test.py checks if strings like "Agent 1:" or "doubt" exist in SKILL.md, but doesn't verify the skill actually executes.
 
 **Solution**: Add integration test that invokes the skill end-to-end or at minimum verifies the skill file can be parsed and all required sections are present.
+
+## 12:06 21/02/26
+
+### Hook precedence causes silent stop hook bypass
+
+**Problem**: Multiple plugins registering Stop hooks execute in alphabetical order. First hook to exit 0 allows termination — subsequent hooks never run. This caused Ralph Loop's stop hook to be silently bypassed by hookify's Stop hook.
+
+**Solution**: Either (a) use single Stop broker plugin, (b) implement explicit priority config, or (c) remove conflicting hooks. Physical logging (`echo >> ~/.claude/hook-debug.log`) required to prove execution order.
+
+### Soul loop needs deterministic backpressure gates
+
+**Problem**: Without enforced gates, AI can claim completion without verification. Need deterministic checks before agentic judgment.
+
+**Solution**: Implement gate hierarchy: max iterations (hard counter), state validation (YAML parse), feature proofs (run proof scripts), test suite (pytest/npm test), then agentic gates (completion promise, soul purpose fulfillment).
+
+## 20:24 21/02/26
+
+### Test specification for skill requires domain adaptation
+
+**Problem**: test-spec-gen skill designed for web apps (routes, auth, database) but being applied to a skill (files, phases, agents). Standard domains don't map directly.
+
+**Solution**: Adapted domains for skill testing: Skill Discovery & Configuration (YAML, phases), Agent Orchestration (Task spawning, blocking), Research Integration (MCP tools), Test Spec Generation (TC-XXX format, templates), Verification & Integration (doubt/finality agents).
+
+### Doubt agent identifies circular validation in meta self-test
+
+**Problem**: Testing the doubt agent functionality using the doubt agent creates circular validation - proves nothing about actual correctness.
+
+**Solution**: Acknowledge as inherent limitation of dogfooding. Document that this is structural validation, not behavioral validation. Recommend separate artifacts: validator spec (mechanics) vs example spec (output format).
+
+### Line number references create maintenance burden
+
+**Problem**: Test cases reference specific line numbers in SKILL.md that break on any edit (65% projected invalidation rate).
+
+**Solution**: Use semantic references instead (Phase X section, YAML frontmatter block). Accept that some fragility remains for structural tests, but prioritize behavior-over-structure assertions where possible.
+
+
