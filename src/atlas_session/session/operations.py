@@ -1120,3 +1120,327 @@ def capability_inventory(project_dir: str, force_refresh: bool = False) -> dict:
         "inventory_file": inventory_file,
         "needs_generation": not cache_hit or force_refresh,
     }
+
+
+# ---------------------------------------------------------------------------
+# refresh_claude_md (approximates /init behavior)
+# ---------------------------------------------------------------------------
+
+
+def refresh_claude_md(project_dir: str) -> dict:
+    """Approximate Claude Code's /init command behavior.
+
+    Analyzes the codebase and generates/upates CLAUDE.md with:
+    - Project Overview (name, goal, stack from package manifests)
+    - Project Structure (directories and key files)
+    - Development Commands (from package.json scripts, Makefile, etc.)
+    - Preserves existing governance sections (Structure Maintenance, Session Context, etc.)
+
+    This is an approximation — the real /init should be run periodically
+    to calibrate. This tool bridges the gap for automated workflows.
+
+    Returns:
+        dict with status, generated_content, governance_preserved, etc.
+    """
+    root = _resolve_project_dir(project_dir)
+    cmd_path = root / "CLAUDE.md"
+
+    # Step 1: Detect project signals
+    root_files = [f for f in root.iterdir() if f.is_file()]
+    signals = _detect_project_signals(root, root_files)
+
+    # Step 2: Extract existing governance sections if CLAUDE.md exists
+    existing_governance = {}
+    if cmd_path.is_file():
+        content = cmd_path.read_text()
+        for section in GOVERNANCE_SECTIONS:
+            found = find_section(content, section)
+            if found:
+                existing_governance[section] = found
+
+    # Step 3: Build CLAUDE.md content
+    lines = []
+    lines.append("# CLAUDE.md")
+    lines.append("")
+    lines.append("This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.")
+    lines.append("")
+
+    # Project Overview
+    lines.append("## Project Overview")
+    lines.append("")
+
+    project_name = signals.get("package_name") or root.name
+    project_goal = signals.get("package_description") or "[Primary objective]"
+    detected_stack = signals.get("detected_stack", [])
+
+    lines.append(f"**Project**: {project_name}")
+    lines.append(f"**Goal**: {project_goal}")
+    lines.append(f"**Stack**: {', '.join(detected_stack) if detected_stack else '[Technologies / platforms]'}")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # Project Structure
+    lines.append("## Project Structure")
+    lines.append("")
+
+    # Analyze directory structure
+    dirs = sorted([d for d in root.iterdir() if d.is_dir() and not d.name.startswith(".")])
+    files = sorted([f for f in root.iterdir() if f.is_file() and not f.name.startswith(".")])
+
+    if dirs:
+        lines.append("### Directories")
+        for d in dirs:
+            lines.append(f"- `{d.name}/` - [Description]")
+        lines.append("")
+
+    if files:
+        lines.append("### Root Files")
+        for f in files:
+            lines.append(f"- `{f.name}` - {f.suffix.upper() if f.suffix else 'file'}")
+        lines.append("")
+
+    # Development Commands
+    lines.append("## Development Commands")
+    lines.append("")
+
+    # Extract from package.json scripts
+    if signals.get("has_package_json"):
+        pkg_path = root / "package.json"
+        try:
+            pkg_data = json.loads(pkg_path.read_text(errors="replace"))
+            scripts = pkg_data.get("scripts", {})
+            if scripts:
+                for name, cmd in scripts.items():
+                    lines.append(f"### {name}")
+                    lines.append(f"```bash")
+                    lines.append(f"{cmd}")
+                    lines.append(f"```")
+                    lines.append("")
+        except Exception:
+            pass
+
+    # Check for Makefile
+    makefile = root / "Makefile"
+    if makefile.is_file():
+        lines.append("### Makefile targets")
+        try:
+            make_content = makefile.read_text(errors="replace")
+            # Extract targets (lines ending with :)
+            for line in make_content.split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and line.endswith(":"):
+                    target = line[:-1]
+                    if not target.startswith("."):
+                        lines.append(f"- `make {target}`")
+            lines.append("")
+        except Exception:
+            pass
+
+    lines.append("---")
+    lines.append("")
+
+    # Step 4: Append preserved governance sections
+    for section_name in GOVERNANCE_SECTIONS:
+        if section_name in existing_governance:
+            lines.append(f"## {section_name}")
+            lines.append("")
+            lines.append(existing_governance[section_name])
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    # Add meta footer
+    lines.append("")
+    lines.append(f"<!-- Generated by atlas-session MCP tool at {datetime.now(timezone.utc).isoformat()} -->")
+    lines.append(f"<!-- Last real /init: [not recorded] -->")
+    lines.append("")
+    lines.append("**Note**: This file was auto-generated by the atlas-session MCP server as an approximation of Claude Code's `/init` command.")
+    lines.append("For best results, run `/init` periodically to calibrate this approximation.")
+
+    generated_content = "\n".join(lines)
+
+    # Step 5: Write to CLAUDE.md
+    try:
+        cmd_path.write_text(generated_content)
+        return {
+            "status": "ok",
+            "claude_md_updated": True,
+            "path": str(cmd_path),
+            "governance_sections_preserved": list(existing_governance.keys()),
+            "project_detected": {
+                "name": project_name,
+                "stack": detected_stack,
+                "has_package_json": signals.get("has_package_json", False),
+                "has_pyproject": signals.get("has_pyproject", False),
+            },
+            "lines_written": len(generated_content.split("\n")),
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "claude_md_updated": False,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Composite operations — reduce MCP round-trips by combining granular ops
+# ---------------------------------------------------------------------------
+
+
+def start_composite(project_dir: str, directive: str = "") -> dict:
+    """Composite session start: preflight + validate + read_context +
+    git_summary + classify_brainstorm + conditional check_clutter.
+
+    Combines the 5-6 MCP calls that always run together at session start
+    into a single round-trip. Each sub-operation is independently guarded
+    so a failure in one does not block the others.
+
+    Args:
+        project_dir: Project directory path.
+        directive: Optional directive text for brainstorm classification.
+
+    Returns:
+        Dict with keys: preflight, validate, read_context, git_summary,
+        classify_brainstorm, clutter (None if root_file_count <= 15).
+    """
+    result: dict = {
+        "preflight": None,
+        "validate": None,
+        "read_context": None,
+        "git_summary": None,
+        "classify_brainstorm": None,
+        "clutter": None,
+    }
+
+    # 1. Preflight — needed to determine mode and root_file_count
+    try:
+        result["preflight"] = preflight(project_dir)
+    except Exception as e:
+        result["preflight"] = {"status": "error", "error": str(e)}
+
+    # 2. Validate
+    try:
+        result["validate"] = validate(project_dir)
+    except Exception as e:
+        result["validate"] = {"status": "error", "error": str(e)}
+
+    # 3. Read context
+    try:
+        result["read_context"] = read_context(project_dir)
+    except Exception as e:
+        result["read_context"] = {"status": "error", "error": str(e)}
+
+    # 4. Git summary
+    try:
+        result["git_summary"] = git_summary(project_dir)
+    except Exception as e:
+        result["git_summary"] = {"status": "error", "error": str(e)}
+
+    # 5. Classify brainstorm — needs project_signals from preflight
+    try:
+        project_signals = {}
+        if isinstance(result["preflight"], dict) and "project_signals" in result["preflight"]:
+            project_signals = result["preflight"]["project_signals"]
+        result["classify_brainstorm"] = classify_brainstorm(directive, project_signals)
+    except Exception as e:
+        result["classify_brainstorm"] = {"status": "error", "error": str(e)}
+
+    # 6. Check clutter — only if root_file_count > 15
+    try:
+        root_file_count = 0
+        if isinstance(result["preflight"], dict):
+            root_file_count = result["preflight"].get("root_file_count", 0)
+        if root_file_count > 15:
+            result["clutter"] = check_clutter(project_dir)
+    except Exception as e:
+        result["clutter"] = {"status": "error", "error": str(e)}
+
+    return result
+
+
+def activate_composite(
+    project_dir: str,
+    soul_purpose: str,
+    old_purpose: str = "(pending)",
+) -> dict:
+    """Composite session activation: archive + hook_activate + features_read.
+
+    Combines the 3 MCP calls that always run together when activating a
+    soul purpose into a single round-trip. Each sub-operation is
+    independently guarded for partial failure resilience.
+
+    Args:
+        project_dir: Project directory path.
+        soul_purpose: The soul purpose to activate.
+        old_purpose: Previous purpose to archive (default: "(pending)").
+
+    Returns:
+        Dict with keys: archive, hook, features.
+    """
+    result: dict = {
+        "archive": None,
+        "hook": None,
+        "features": None,
+    }
+
+    # 1. Archive — set soul purpose (archives old, sets new)
+    try:
+        result["archive"] = archive(project_dir, old_purpose, soul_purpose)
+    except Exception as e:
+        result["archive"] = {"status": "error", "error": str(e)}
+
+    # 2. Hook activate — enable stop hook warnings
+    try:
+        result["hook"] = hook_activate(project_dir, soul_purpose)
+    except Exception as e:
+        result["hook"] = {"status": "error", "error": str(e)}
+
+    # 3. Features read — extract feature claims for tracking
+    try:
+        result["features"] = features_read(project_dir)
+    except Exception as e:
+        result["features"] = {"status": "error", "error": str(e)}
+
+    return result
+
+
+def close_composite(project_dir: str) -> dict:
+    """Composite session close: harvest + features_read + hook_deactivate.
+
+    Combines the 3 MCP calls that always run together during session
+    settlement into a single round-trip. Each sub-operation is
+    independently guarded for partial failure resilience.
+
+    Args:
+        project_dir: Project directory path.
+
+    Returns:
+        Dict with keys: harvest, features, hook.
+    """
+    result: dict = {
+        "harvest": None,
+        "features": None,
+        "hook": None,
+    }
+
+    # 1. Harvest — scan for promotable content
+    try:
+        result["harvest"] = harvest(project_dir)
+    except Exception as e:
+        result["harvest"] = {"status": "error", "error": str(e)}
+
+    # 2. Features read — check feature claim status
+    try:
+        result["features"] = features_read(project_dir)
+    except Exception as e:
+        result["features"] = {"status": "error", "error": str(e)}
+
+    # 3. Hook deactivate — remove lifecycle state file
+    try:
+        result["hook"] = hook_deactivate(project_dir)
+    except Exception as e:
+        result["hook"] = {"status": "error", "error": str(e)}
+
+    return result
