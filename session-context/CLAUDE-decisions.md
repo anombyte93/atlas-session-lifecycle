@@ -68,7 +68,7 @@ Security-first architecture decisions:
 27. **Promise tag for graceful loop termination**: User outputs `<promise>EXACT_TEXT</promise>` to exit soul loop early. Hook scans transcript JSON for matching promise tag. Enables human-controlled completion condition within enforced iteration constraints.
 
 ## 12:38 21/02/26
-28. **Blocking MCP check in /start prevents silent failures**: Added `claude mcp list | grep "atlas-session"` check in both Init and Reconcile modes. If MCP is not connected, /start STOPS immediately with clear error message instead of attempting "AI slop" fallback behavior.
+28. **~~Blocking MCP check~~ REVERSED — assume MCP available, handle errors**: Originally added `claude mcp list` check but it was too slow and blocked workflows. Replaced with try-first approach: call `session_start()` directly, STOP only if it errors/times out. Never run `claude mcp list` in skills.
 29. **Extended soul loop gates for hierarchical enforcement**: Added --gates flag to soul-loop setup script. New gates: research (test-spec-gen), e2e (playwright tests), acceptance (trello-test). Gates configured from project structure (tests/e2e/, config/trello-testing.json).
 30. **Auto-invocation of soul-loop from /start**: When soul purpose involves code keywords (implement, build, fix, add, create, refactor, update, write), /start automatically invokes /soul-loop with intensity from task size and gates from project structure.
 
@@ -78,3 +78,13 @@ No new decisions this session.
 
 ## 15:02:21 21/02/26
 No new decisions this session.
+
+## 18:45 24/02/26
+
+31. **Single source of truth for SKILL.md**: `skills/start/SKILL.md` in repo is the source. `~/.claude/skills/start/SKILL.md` is a deployment artifact copied by install script. Root `SKILL.md` deleted — 3 diverged copies caused "says one thing, does another" bugs.
+
+32. **Composite MCP tools (facade pattern)**: Created `session_start`, `session_activate`, `session_close` that combine 5-8 granular operations into single calls. Reduces /start from 8 MCP round-trips to 3. Granular tools preserved for backward compatibility and exploratory use. Research confirmed hybrid pattern is optimal.
+
+33. **custom.md is preferences only, never workflow overrides**: custom.md was contradicting SKILL.md on service fallback behavior. Scoped strictly: tone, doubt-before-settlement, CI/CD gap surfacing. Never duplicates or overrides SKILL.md workflow steps.
+
+34. **Graceful degradation as policy, not code**: Added Service Availability table to SKILL.md. Only atlas-session MCP is required (STOP if unavailable). All other services (AtlasCoin, Perplexity, Context7, Bitwarden) continue with degraded mode. Never block workflow on external services.
