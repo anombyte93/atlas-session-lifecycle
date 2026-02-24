@@ -67,3 +67,14 @@ Security-first architecture decisions:
 26. **Hierarchical gate design for backpressure**: Critical (hard block: max iterations, corruption, 10+ failures), Quality (soft warning: test failures, feature proof failures), Progressive (friction: 5+ failures warn, 10+ hard stop), Agentic (allow exit: completion promise matched). This follows Huntley's "Engineering Backpressure" — deterministic first (90%), agentic second (10%).
 27. **Promise tag for graceful loop termination**: User outputs `<promise>EXACT_TEXT</promise>` to exit soul loop early. Hook scans transcript JSON for matching promise tag. Enables human-controlled completion condition within enforced iteration constraints.
 
+## 12:38 21/02/26
+28. **Blocking MCP check in /start prevents silent failures**: Added `claude mcp list | grep "atlas-session"` check in both Init and Reconcile modes. If MCP is not connected, /start STOPS immediately with clear error message instead of attempting "AI slop" fallback behavior.
+29. **Extended soul loop gates for hierarchical enforcement**: Added --gates flag to soul-loop setup script. New gates: research (test-spec-gen), e2e (playwright tests), acceptance (trello-test). Gates configured from project structure (tests/e2e/, config/trello-testing.json).
+30. **Auto-invocation of soul-loop from /start**: When soul purpose involves code keywords (implement, build, fix, add, create, refactor, update, write), /start automatically invokes /soul-loop with intensity from task size and gates from project structure.
+
+## 13:57 21/02/26
+No new decisions this session.
+
+
+## 15:02:21 21/02/26
+No new decisions this session.

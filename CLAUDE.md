@@ -4,58 +4,158 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Project**: [Project Name]
-**Goal**: [Primary objective]
-**Stack**: [Technologies / platforms]
+**Project**: Atlas Session Lifecycle
+**Goal**: MCP server for AI session lifecycle management — persistent memory, soul purpose tracking, and contract verification for Claude Code
+**Stack**: Python 3.10+, FastMCP, FastAPI, HTMX, TailwindCSS, Playwright, pytest
+
+---
+
+## Architecture
+
+### Modular Monolith Design
+
+The MCP server (`src/atlas_session/server.py`) is a single FastMCP application with three tool domains:
+
+1. **Session tools** (`session/`): Session lifecycle management (init, validate, read_context, harvest, archive, check_clutter, cache/restore_governance)
+2. **Contract tools** (`contract/`): Bounty creation and verification with executable test criteria
+3. **Stripe tools** (`stripe/`): License and payment processing (optional)
+
+**Key pattern**: Stateless tools with file-based state management. All state lives in `session-context/` directories.
+
+### MCP Tool Registration
+
+FastMCP tools are registered via decorator functions in each domain's `tools.py`. The server entry point aggregates all domains:
+
+```python
+session_tools.register(mcp)
+contract_tools.register(mcp)
+stripe_tools.register(mcp)
+```
+
+### Deterministic Operations
+
+Session operations use JSON-outputting subcommands in `session/operations.py`. Each operation returns structured JSON that the skill layer (SKILL.md) interprets.
+
+### Contract/Bounty System
+
+- Contracts define executable test criteria at creation time
+- Verification just runs tests — no subjective judgment required
+- Criteria types: `shell`, `context_check`, `file_exists`, `git_check`
+- Local `session-context/contract.json` + optional AtlasCoin remote bounty
+
+---
+
+## Development Commands
+
+### Testing
+
+```bash
+# Run all tests
+pytest tests/
+
+# Run specific test suite
+pytest tests/unit/
+pytest tests/integration/
+pytest tests/e2e/
+
+# Run with coverage
+pytest tests/ --cov=atlas_session --cov-report=html
+
+# Run single test file
+pytest tests/unit/test_session_operations.py -v
+```
+
+### MCP Server
+
+```bash
+# Run MCP server (stdio - for Claude Code)
+python -m atlas_session.server
+
+# Run HTTP transport (for remote access)
+python -m atlas_session.server --transport http
+
+# Install for development
+pip install -e ".[dev]"
+```
+
+### Linting/Formatting
+
+```bash
+# Lint
+ruff check src/
+
+# Format
+ruff format src/
+
+# Lint and format
+ruff check --fix src/ && ruff format src/
+```
+
+### Web Dashboard
+
+```bash
+cd web
+./run.sh
+# Runs at http://127.0.0.1:8080
+```
 
 ---
 
 ## Project Structure
 
-### Root Files
-- `CLAUDE.md` - Claude Code instructions (this file)
-- [Other root-level files that stay at root]
+```
+src/atlas_session/     # MCP server package
+├── server.py          # FastMCP server entry point
+├── session/           # Session lifecycle tools
+│   ├── tools.py       # MCP tool decorators
+│   └── operations.py  # Deterministic JSON operations
+├── contract/          # Bounty/contract tools
+│   ├── tools.py       # MCP tool decorators
+│   ├── model.py       # Contract/Criterion dataclasses
+│   ├── verifier.py    # Test execution logic
+│   └── atlascoin.py   # AtlasCoin API client
+├── stripe/            # License/payment tools
+└── common/            # Shared utilities
 
-### session-context/
-CLAUDE memory bank files (managed by /start skill):
-- `CLAUDE-activeContext.md` - Current session state, goals, progress
-- `CLAUDE-decisions.md` - Architecture decisions and rationale
-- `CLAUDE-patterns.md` - Established code patterns and conventions
-- `CLAUDE-troubleshooting.md` - Common issues and proven solutions
-- `CLAUDE-soul-purpose.md` - Soul purpose definition
+web/                   # FastAPI + HTMX dashboard
+├── app.py             # FastAPI app
+├── templates/         # Jinja2 templates
+└── static/            # CSS/JS assets
 
-### scripts/
-- `scripts/[category]/` - [Description]
+skills/                # Claude Code skills (/.claude/skills/)
+├── start/SKILL.md     # Main /start skill orchestrator
+├── stop/SKILL.md      # /stop skill
+├── stepback/SKILL.md  # /stepback skill
+└── sync/SKILL.md      # /sync skill
 
-### docs/
-- `docs/[category]/` - [Description]
+templates/             # Immutable session file templates
+├── CLAUDE-activeContext.md
+├── CLAUDE-decisions.md
+├── CLAUDE-patterns.md
+├── CLAUDE-soul-purpose.md
+└── CLAUDE-troubleshooting.md
+
+tests/                 # Test suite
+├── unit/              # Unit tests for operations/models
+├── integration/       # MCP protocol & lifecycle flows
+└── e2e/               # Playwright dashboard tests
+
+scripts/               # Installation & utility scripts
+```
 
 ---
 
-## Structure Maintenance Rules
+## Session Context Files
 
-> These rules ensure the project stays organized across sessions.
+The five-file memory bank lives in `session-context/`:
 
-- **CLAUDE.md** stays at root (Claude Code requirement)
-- **Session context** files live in `session-context/` - NEVER at root
-- **Scripts** (.sh, .ps1, .py, .js, .ts) go in `scripts/<category>/`
-- **Documentation** (.md, .txt guides/reports) go in `docs/<category>/`
-- **Config** files (.json, .yaml, .toml) go in `config/` unless framework-required at root
-- **Logs** go in `logs/`
-- When creating new files, place them in the correct category directory
-- Do NOT dump new files at root unless they are actively being worked on
-- Periodically review root for stale files and move to correct category
-
----
-
-## Session Context Files (MUST maintain)
-
-After every session, update these files in `session-context/` with timestamp and reasoning:
-
-- `session-context/CLAUDE-activeContext.md` - Current session state, goals, progress
-- `session-context/CLAUDE-decisions.md` - Architecture decisions and rationale
-- `session-context/CLAUDE-patterns.md` - Established code patterns and conventions
-- `session-context/CLAUDE-troubleshooting.md` - Common issues and proven solutions
+| File | Purpose |
+|------|---------|
+| `CLAUDE-activeContext.md` | Current session state, goals, progress |
+| `CLAUDE-decisions.md` | Architecture decisions and rationale |
+| `CLAUDE-patterns.md` | Established code patterns and conventions |
+| `CLAUDE-troubleshooting.md` | Common issues and proven solutions |
+| `CLAUDE-soul-purpose.md` | Soul purpose definition and completion criteria |
 
 **Entry Format**:
 ```markdown
@@ -74,77 +174,83 @@ Potential Issues to face:
 
 ---
 
-## Common Commands
+## Structure Maintenance Rules
 
-### [Category]
+- **CLAUDE.md** stays at root (Claude Code requirement)
+- **Session context** files live in `session-context/` — NEVER at root
+- **Scripts** go in `scripts/<category>/`
+- **Documentation** goes in `docs/<category>/`
+- **Config** files go in `config/` unless framework-required at root
+- **Logs** go in `logs/`
+
+---
+
+## Installation
+
 ```bash
-[Useful command]
+# Skill mode (default)
+curl -fsSL https://raw.githubusercontent.com/anombyte93/atlas-session-lifecycle/main/install.sh | bash
+
+# Plugin mode
+curl -fsSL ... | bash -s -- --plugin
+
+# Update
+bash install.sh --update
 ```
 
 ---
 
-## Current Status
+## Security Considerations
 
-### DONE
-- [Completed items]
+- **Command allowlist**: Contract shell commands restricted to allowlist (git, python3, npm, etc.)
+- **Path validation**: All `project_dir` parameters resolved via `Path.resolve()` to prevent traversal attacks
+- **HMAC-signed tokens**: License tokens use SHA-256 HMAC to prevent bypass
+- **Commit pinning**: Installer uses specific commit hashes for reproducible installs
 
-### NEED TO DO
-- [Remaining items]
-
-### CRITICAL WARNINGS
-- [Important warnings]
+See `session-context/CLAUDE-decisions.md` for full security architecture decisions.
 
 ---
 
-## Workflow Before Completing Tasks
+## MCP Configuration
 
-1. Use 3 explore agents to understand the issue
-2. Invoke `superpower:brainstorm` skill
-3. Invoke PLAN mode to create a plan
-4. Invoke `prd-taskmaster` skill for task breakdown backed by DEEP research
-5. Invoke debugger in parallel if not a sequential task
-6. After each parent task: invoke `@doubt-agent` and `@finality-agent` to verify
-7. Loop until task complete and verified working from user feedback
-
-**Research**: Use `perplexity-api-free` for comprehensive DEEP research before any work.
-
----
-
-## Ralph Loop Variables
-
-When user invokes `/ralph-wiggum:ralph-loop`:
+Claude Code uses `~/.claude.json` (NOT `~/.claude/mcp_config.json`) for MCP server registration.
 
 ```bash
---completion-promise [Define what "done" means for this project]
---max-iterations 5
+# Add MCP server (global scope)
+claude mcp add -s user atlas-session python -m atlas_session.server
+
+# Add MCP server (project scope)
+claude mcp add -s local atlas-session python -m atlas_session.server
+
+# List MCP servers
+claude mcp list
 ```
 
 ---
 
-## User Commands
+## CI/CD
 
-### `/ralph-wiggum:ralph-loop <prompt>`
-Starts Ralph Loop with variables from Ralph Loop Variables section above.
-
-### `state`
-Shows what has been done, what needs to be done, and recent content from context files.
-Also updates `session-context/CLAUDE-activeContext.md`, `session-context/CLAUDE-decisions.md`, `session-context/CLAUDE-patterns.md`, `session-context/CLAUDE-troubleshooting.md` if they haven't been updated.
-
----
-
-## Architecture Decisions
-
-See `session-context/CLAUDE-decisions.md` for full decision log.
+- **ci.yml**: Tests on Python 3.10/3.11/3.12
+- **publish.yml**: Package publishing to PyPI
+- **claude-review.yml**: Claude Code review automation
+- **release-please.yml**: Automated releases
+- **review-gate.yml**: PR review gating
 
 ---
 
-## Troubleshooting
+## Soul Purpose Lifecycle
 
-See `session-context/CLAUDE-troubleshooting.md` for full troubleshooting guide.
+```
+Define --> Work --> Reconcile --> Assess --> Close or Continue
+```
+
+**Key invariant**: The AI never closes a soul purpose. It assesses and suggests; the user decides.
+
+See `/start` skill (`skills/start/SKILL.md`) for full lifecycle orchestration.
 
 ---
 
 ## IMMUTABLE TEMPLATE RULES
 
-> **DO NOT** edit the template files bundled with the plugin.
+> **DO NOT** edit the template files in `templates/`.
 > Templates are immutable source-of-truth. Only edit the copies in your project.

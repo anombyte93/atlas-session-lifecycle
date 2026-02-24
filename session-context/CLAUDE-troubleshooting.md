@@ -195,4 +195,27 @@ Task(
 
 **Solution**: Changed condition to `[[ "$TEST_STATUS" == "pass" || "$TEST_STATUS" == "unknown" ]]` — allow promise-based exit for both passing and no-test scenarios.
 
+## 12:38 21/02/26
 
+### /start fails silently when atlas-session MCP not available
+
+**Problem**: /start skill attempted to proceed without verifying atlas-session MCP was connected, leading to confusing "AI slop" fallback behavior instead of clear error message.
+
+**Solution**: Added blocking MCP check at start of both Init and Reconcile modes: `claude mcp list | grep "atlas-session"`. If not "✓ Connected", STOP immediately with clear error message and fix instructions.
+
+### ToolSearch doesn't find connected MCP servers
+
+**Problem**: Attempted to use `ToolSearch` to discover atlas-session MCP tools, but ToolSearch only finds deferred tools, not already-connected MCP servers.
+
+**Solution**: Use `claude mcp list | grep "server-name"` instead to verify MCP connection status. Look for "✓ Connected" indicator.
+
+
+## 13:57 21/02/26
+No new issues this session.
+
+
+## 15:02:21 21/02/26
+**Issue**: Perplexity MCP requires __Secure-next-auth.session-token cookie
+**Root Cause**: Cookie is set via JavaScript after page load, not in HTTP headers
+**Workaround**: Manual browser interaction required via ~/.claude/scripts/get-perplexity-cookie.sh
+**Long-term**: Consider using Playwright with proper display server (xvfb) or user-prompt workflow

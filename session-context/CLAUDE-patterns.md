@@ -114,3 +114,14 @@ echo "RALPH STOP FIRED $(date)" >> ~/.claude/hook-debug.log
 21. **Progressive friction implementation**: Use simple line-count failure counter (one line per failure). Check with `wc -l`. At 5 failures, warn user. At 10 failures, hard stop. This creates increasing friction without blocking legitimate debugging.
 22. **Promise tag detection in transcripts**: Greedy search through transcript JSON for `<promise>PROMISE_TEXT</promise>` tag. Try multiple grep patterns since JSON formats vary (compact vs pretty-printed). Allow exit only on exact match with configured completion_promise.
 
+## 12:38 21/02/26
+23. **MCP availability check pattern**: `claude mcp list | grep "server-name"` to verify connection status before attempting to use MCP tools. Look for "✓ Connected" vs "✗ Failed" or missing entry.
+24. **Gate configuration from project structure**: Dynamically enable soul-loop gates based on directory existence (tests/e2e/ for e2e gate) or config files (config/trello-testing.json for acceptance gate). Base gates always enabled: research,deterministic.
+25. **Auto-invocation pattern**: /start detects code keywords in soul purpose (implement, build, fix, add, create, refactor, update, write) → determines intensity from task size → invokes /soul-loop with --gates flag.
+
+## 13:57 21/02/26
+No new patterns this session.
+
+
+## 15:02:21 21/02/26
+No new patterns this session.
