@@ -127,3 +127,72 @@ def register(mcp: FastMCP) -> None:
         Deterministic — no comparison or judgment. AI compares against
         read_context to detect stale context."""
         return ops.git_summary(project_dir)
+
+    @mcp.tool
+    def session_capability_inventory(
+        project_dir: str,
+        force_refresh: bool = False,
+    ) -> dict:
+        """Returns cached inventory if git HEAD unchanged, otherwise signals
+        that full codebase analysis is needed. Triggers Explore agent for
+        capability mapping: MCP tools, tests, security claims, feature claims.
+        For use with /research-before-coding validation. Returns dict with
+        cache status; if needs_generation=True, caller should spawn Explore
+        agent to generate CLAUDE-capability-inventory.md."""
+        return ops.capability_inventory(project_dir, force_refresh)
+
+    @mcp.tool
+    def session_refresh_claude_md(project_dir: str) -> dict:
+        """Approximate Claude Code's /init command behavior.
+
+        Analyzes the codebase and generates/updates CLAUDE.md with project
+        overview, structure, and commands while preserving existing governance
+        sections (Structure Maintenance Rules, Session Context Files, etc.).
+
+        This is an approximation — for best results, run the real /init
+        periodically to calibrate. Use this for automated workflows where
+        manual /init invocation isn't feasible.
+
+        The tool follows the cache/restore pattern internally: it preserves
+        any existing governance sections before regenerating content.
+        """
+        return ops.refresh_claude_md(project_dir)
+
+    # ------------------------------------------------------------------
+    # Composite tools — reduce MCP round-trips for common workflows
+    # ------------------------------------------------------------------
+
+    @mcp.tool
+    def session_start(
+        project_dir: str,
+        directive: str = "",
+    ) -> dict:
+        """Composite session start — runs preflight, validate, read_context,
+        git_summary, classify_brainstorm, and check_clutter (if root has
+        >15 files) in a single MCP call. Replaces 5-6 individual tool
+        calls at session startup. Each sub-operation is independently
+        guarded: if one fails, the others still run and the error is
+        included in that key's result."""
+        return ops.start_composite(project_dir, directive)
+
+    @mcp.tool
+    def session_activate(
+        project_dir: str,
+        soul_purpose: str,
+        old_purpose: str = "(pending)",
+    ) -> dict:
+        """Composite session activation — runs archive (set soul purpose),
+        hook_activate (enable stop hook warnings), and features_read
+        (extract feature claims) in a single MCP call. Replaces 3
+        individual tool calls when activating a soul purpose. Each
+        sub-operation is independently guarded for partial failure."""
+        return ops.activate_composite(project_dir, soul_purpose, old_purpose)
+
+    @mcp.tool
+    def session_close(project_dir: str) -> dict:
+        """Composite session close — runs harvest (scan for promotable
+        content), features_read (check feature claim status), and
+        hook_deactivate (remove lifecycle state) in a single MCP call.
+        Replaces 3 individual tool calls during session settlement. Each
+        sub-operation is independently guarded for partial failure."""
+        return ops.close_composite(project_dir)

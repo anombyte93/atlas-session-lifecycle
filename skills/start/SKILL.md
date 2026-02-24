@@ -35,62 +35,126 @@ The skill NEVER finishes with "ready to go" and stops. After setup, immediately 
 7. **Trust separation** — for bounty verify, spawn a separate finality Task agent. Never the same agent that submits.
 8. **AtlasCoin is optional** — if the service is down, tell the user and continue without bounty tracking.
 
+## Service Availability (MANDATORY)
+
+1. **NEVER run `claude mcp list`** — assume atlas-session is available, handle errors on first call
+2. **NEVER block on external services** — log the gap and continue with degraded mode
+3. **Fallback hierarchy**: try tool → if error/timeout → tell user what's degraded → continue
+
+| Service | If Unavailable | Action |
+|---------|---------------|--------|
+| atlas-session MCP | `session_start` errors/times out | STOP — required for /start |
+| AtlasCoin | `contract_health()` fails | Continue without bounty tracking |
+| Perplexity | Research queries fail | Context7 + WebSearch fallback |
+| Context7 | Doc queries fail | Perplexity results only |
+| Bitwarden | Vault locked/unavailable | Tell user, skip credential fetch |
+
 ---
 
 # INIT MODE
 
-> Triggered when `session_preflight` returns `"mode": "init"`.
+> Triggered when `session_start` returns `preflight.mode == "init"`.
 
-## Step 1: Preflight + Ralph Questions
+## Step 1: Preflight + Assessment (composite)
 
-1. Call `session_preflight(project_dir)` — get mode, git status, project signals, template validity.
+**MCP AVAILABILITY** — assume atlas-session is available (do NOT run `claude mcp list`):
 
-2. **In parallel** with preflight, ask the user Ralph questions via AskUserQuestion:
-   - **Question 1**: "How should Ralph Loop work?" — Options: "Automatic", "Manual", "Skip"
-   - **Question 2** (only if Ralph = Automatic): "What intensity?" — Options: "Small (5 iterations)", "Medium (20 iterations)", "Long (100 iterations + PRD)"
-   - Store as `RALPH_MODE`, `RALPH_INTENSITY`.
+1. Call `session_start(project_dir, DIRECTIVE)` — returns combined preflight + validate + read_context + git_summary + classify_brainstorm + clutter check in ONE call.
+2. If the call **errors or times out**, STOP and inform user:
+   ```
+   atlas-session MCP is not responding. /start requires this MCP to function.
 
-## Step 2: Classify Brainstorm + File Organization
+   To fix:
+   1. Check ~/.claude.json or project .mcp.json has atlas-session entry
+   2. Verify Python module: python3 -c "from atlas_session import server"
+   3. Restart Claude Code after fixing
+   ```
+   Do NOT proceed with any other steps if session_start fails.
+3. Extract results: `preflight = result["preflight"]`, `read_context = result["read_context"]`, `git_summary = result["git_summary"]`, `classify_brainstorm = result["classify_brainstorm"]`, `clutter = result["clutter"]`.
 
-1. Call `session_classify_brainstorm(DIRECTIVE, project_signals)` — returns `{weight, has_directive, has_content}`.
-2. Store `BRAINSTORM_WEIGHT` for Step 4.
+## Step 2: Brainstorm Weight + File Organization
 
-**File organization** (only if `root_file_count > 15`):
+1. Extract `BRAINSTORM_WEIGHT` from `result["classify_brainstorm"]["weight"]` for Step 4.
 
-Call `session_check_clutter(project_dir)`. If `status` is "cluttered", present the grouped move map:
+**File organization** (only if `result["clutter"]` is present and `status` is "cluttered"):
+
+Present the grouped move map from `result["clutter"]`:
 - "Your project root has [N] misplaced files. Proposed cleanup: [summary]. Approve?"
 - Options: "Yes, clean up", "Show details first", "Skip"
 - If approved, execute moves via `git mv` (if `is_git`) or file operations.
 
-## Step 3: Silent Bootstrap
+## Step 3: Silent Bootstrap + CI/CD Detection
 
-1. Call `session_init(project_dir, DIRECTIVE_OR_PENDING, RALPH_MODE, RALPH_INTENSITY)`
-2. Call `session_ensure_governance(project_dir, RALPH_MODE, RALPH_INTENSITY)`
+1. Call `session_init(project_dir, DIRECTIVE_OR_PENDING)`
+2. Call `session_ensure_governance(project_dir)`
 3. Call `session_cache_governance(project_dir)`
 4. Run `/init` (Claude Code built-in — refreshes CLAUDE.md. Must run in main thread.)
 5. Call `session_restore_governance(project_dir)`
+
+**CI/CD Scaffold Detection** (smart, zero-friction):
+
+Use `project_signals` from `result["preflight"]` (already available from Step 1).
+
+Determine CI/CD action based on these rules:
+
+| Condition | Action |
+|-----------|--------|
+| `has_ci == true` | Skip — already has CI/CD |
+| `has_code_files == false` OR `is_empty_project == true` | Skip — no code to test |
+| Simple script only (1-2 `.py`/`.sh` files, no package manifest) | Skip — toy project |
+| Has package manifest (`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`) | **Prompt user** (see below) |
+| 3+ code files but no package manifest | **Prompt user** (see below) |
+
+**Prompt when needed**:
+
+"This project has code files but no CI/CD. Atlas-Copilot can scaffold GitHub Actions workflows (CI tests + Claude review). Enable?"
+
+Options:
+- "Yes, full CI" — scaffold both CI and review workflows
+- "CI only" — scaffold CI workflow only
+- "Skip" — don't scaffold, don't ask again this session
+
+**Scaffold logic** (if user accepts):
+
+Detect language/stack from `project_signals`:
+- `has_package_json` → Node.js
+- `has_pyproject` → Python
+- `has_go_mod` → Go
+- `has_cargo_toml` → Rust
+- Default → Python if `.py` files exist, else generic
+
+Create `.github/workflows/` directory, then:
+1. **CI workflow** (`ci.yml`): calls `anombyte93/atlas-copilot/.github/workflows/reusable-ci.yml@v1` with appropriate inputs
+2. **Review workflow** (`claude-review.yml`): calls `anombyte93/atlas-copilot/.github/workflows/reusable-claude-review.yml@v1`
+
+Use language-specific defaults:
+| Stack | test-command | build-command | install-command |
+|-------|--------------|---------------|-----------------|
+| Node.js | `npm test -- --coverage --ci` | `npm run build` | `npm ci` |
+| Python | `pytest tests/ -x --tb=short` | (empty) | `pip install -e ".[dev]"` |
+| Go | `go test ./... -v -race` | (empty) | `go mod download` |
+| Rust | `cargo test --verbose` | `cargo build --verbose` | (empty) |
+
 6. Read `custom.md` if it exists, follow instructions under "During Init".
 
-## Step 4: Brainstorm + Activate + Continuation
+## Step 4: Quick Clarify + Activate + Continuation
 
-**Brainstorm runs first (always)**:
+**Quick Clarify runs first (always)**:
 
-Invoke `skill: "superpowers:brainstorming"` with weight from Step 2:
-- **lightweight**: Args include instruction: "Lightweight brainstorm. Confirm direction with 1-2 questions, derive soul purpose. No design doc."
-- **standard**: Normal brainstorm flow, skip design doc if task is clear.
-- **full**: Complete brainstorm flow including design doc.
+Invoke `skill: "quick-clarify"` with the DIRECTIVE.
+This asks 3 questions: deliverable type, done criteria, and size.
+For Medium/Large tasks, it also runs research.
 
 After brainstorm completes:
 
-1. Call `session_archive(project_dir, DIRECTIVE_OR_PENDING, DERIVED_SOUL_PURPOSE)` — sets the real soul purpose.
-2. Call `session_hook_activate(project_dir, DERIVED_SOUL_PURPOSE)` — enables stop hook warnings.
-3. Check `session_features_read(project_dir)` — extract any feature claims for tracking.
+1. Call `session_activate(project_dir, DERIVED_SOUL_PURPOSE, DIRECTIVE_OR_PENDING)` — sets soul purpose, enables stop hook, and returns feature claims in ONE call.
+2. Extract feature claims from the result for tracking.
 
 **Bounty creation** (optional):
 
 Call `contract_health()`. If healthy, call `contract_create(project_dir, DERIVED_SOUL_PURPOSE, escrow, criteria)` using `contract_draft_criteria` for suggestions.
 
-Escrow by Ralph intensity: skip=50, small=100, medium=200, long=500.
+Default escrow: 100. Increase for complex soul purposes at AI's discretion.
 
 If AtlasCoin is down, tell user and continue without bounty.
 
@@ -106,42 +170,106 @@ If AtlasCoin is down, tell user and continue without bounty.
 5. Invoke `superpowers:test-driven-development` if soul purpose involves code.
 6. Invoke `superpowers:writing-plans` if soul purpose has 3+ steps.
 
-### Ralph Loop Invocation
+### Auto-Invocation of Soul Loop (MANDATORY for code tasks)
 
-When `RALPH_MODE = "automatic"`, call the `Skill` tool:
+**Detect if Soul Loop should be enabled:**
+
+1. **Check if soul purpose involves code** — Look for keywords: "implement", "build", "fix", "add", "create", "refactor", "update", "write"
+2. **Determine intensity from task size** (from quick-clarify):
+   - Small → `--intensity small`
+   - Medium → `--intensity medium`
+   - Large → `--intensity long`
+
+3. **Configure gates from project structure**:
+   ```bash
+   GATES="research,deterministic"
+
+   # Add E2E gate if tests/e2e/ exists
+   if [[ -d "$PROJECT_DIR/tests/e2e" ]]; then
+     GATES="$GATES,e2e"
+   fi
+
+   # Add Acceptance gate if config/trello-testing.json exists
+   if [[ -f "$PROJECT_DIR/config/trello-testing.json" ]]; then
+     GATES="$GATES,acceptance"
+   fi
+   ```
+
+4. **Invoke Soul Loop**:
+   ```
+   /soul-loop "$DERIVED_SOUL_PURPOSE" --intensity $INTENSITY --gates "$GATES"
+   ```
+
+**This is automatic** — do not ask the user. Soul Loop provides the backpressure guardrails for iterative development.
+
+### Ralph Loop Invocation (optional, for iterative work)
+
+If iterative development is appropriate for the soul purpose, use `/ralph-loop`:
+
+```
+/ralph-loop "DERIVED_SOUL_PURPOSE" --max-iterations N --completion-promise "TEXT"
+```
+
+The user controls iterations and completion promises.
+
+**CRITICAL**: you must call the `Skill` tool — not just mention it in text.
+
+### Soul Loop Invocation (backpressure-enforced iteration)
+
+Soul Loop enforces hierarchical backpressure gates on each iteration. Use for iterative development that needs quality guardrails.
 
 | Intensity | Invocation |
-|-----------|-----------|
-| **Small** | `skill: "ralph-wiggum:ralph-loop"`, `args: "SOUL_PURPOSE --max-iterations 5 --completion-promise 'Soul purpose fulfilled'"` |
-| **Medium** | `skill: "ralph-wiggum:ralph-loop"`, `args: "SOUL_PURPOSE --max-iterations 20 --completion-promise 'Soul purpose fulfilled and code tested'"` |
-| **Long** | First `skill: "prd-taskmaster"`, args: SOUL_PURPOSE. Then `skill: "ralph-wiggum:ralph-loop"`, `args: "SOUL_PURPOSE --max-iterations 100 --completion-promise 'Must validate with 3x doubt agents and 1x finality agent'"` |
+|-----------|------------|
+| **Small** | `/soul-loop "SOUL_PURPOSE" --intensity small` |
+| **Medium** | `/soul-loop "SOUL_PURPOSE" --intensity medium` |
+| **Long** | First `skill: "prd-taskmaster"`, then `/soul-loop "SOUL_PURPOSE" --intensity long` |
 
-**CRITICAL**: You must call the `Skill` tool — not just mention it in text.
+**Gate Hierarchy:**
+- **Critical (hard block)**: Max iterations, state corruption, 10+ failures
+- **Quality (soft warning)**: Test failures, feature proof failures
+- **Progressive (friction)**: 5+ failures warns, 10+ hard stops
+- **Agentic (allow exit)**: Completion promise matched via `<promise>` tag
+
+**To complete**: Output `<promise>YOUR_COMPLETION_PROMISE</promise>` when done.
+
+**CRITICAL**: Soul loop enforces backpressure. Test failures allow continued iteration with warnings. After 10 failures, hard block.
 
 ---
 
 # RECONCILE MODE
 
-> Triggered when `session_preflight` returns `"mode": "reconcile"`.
+> Triggered when `session_start` returns `preflight.mode == "reconcile"`.
 >
 > **UX**: Everything in Steps 1-2 is invisible to the user. First visible interaction is a question (Step 3) or seamless work continuation (Step 4).
 
-## Step 1: Silent Assessment + Context Reality Check
+## Step 0: Sync Previous State
 
-1. Call `session_validate(project_dir)` — repair any missing session files.
-2. Call `session_cache_governance(project_dir)`
-3. Run `/init` in main thread.
-4. Call `session_restore_governance(project_dir)`
-5. Call `session_read_context(project_dir)` — get soul purpose, open tasks, Ralph config, status hint.
-6. Call `session_git_summary(project_dir)` — get recent commits, changed files, branch state.
+Before any assessment, save the current session state so context files reflect reality:
+
+1. Invoke `/sync` — updates all session-context files and MEMORY.md with current progress.
+2. This is silent — no output shown to user.
+
+## Step 1: Silent Assessment + Context Reality Check (composite)
+
+**MCP AVAILABILITY** — assume atlas-session is available (do NOT run `claude mcp list`):
+
+1. Call `session_start(project_dir, DIRECTIVE)` — returns combined assessment in one call.
+2. If the call **errors or times out**, STOP and inform user (same message as Init Mode). Do NOT proceed.
+3. Extract: `preflight`, `validate`, `read_context`, `git_summary`, `classify_brainstorm`, `clutter` from the result.
+4. Call `session_cache_governance(project_dir)`
+5. Run `/init` in main thread.
+6. Call `session_restore_governance(project_dir)`
 7. **Compare** `read_context` against `git_summary`: if context is stale (commits exist that aren't reflected in active context), update `session-context/CLAUDE-activeContext.md` with real progress.
-8. Check bounty: if `session-context/BOUNTY_ID.txt` exists, call `contract_get_status(project_dir)`.
-9. Read `custom.md` if it exists, follow instructions under "During Reconcile".
+8. Check capability inventory: call `session_capability_inventory(project_dir)` and check response.
+   - If `cache_hit == True` and `git_changed == False`: inventory is current, skip extraction.
+   - If `needs_generation == True`: inventory requires generation. The MCP tool returns `inventory_path` when ready.
+9. Read `CLAUDE-capability-inventory.md` if it exists. Extract untested code, security claims, and feature claims with gaps.
+10. Check bounty: if `session-context/BOUNTY_ID.txt` exists, call `contract_get_status(project_dir)`.
+11. Read `custom.md` if it exists, follow instructions under "During Reconcile".
 
 ### Root Cleanup
 
-If `root_file_count > 15` from preflight: call `session_check_clutter(project_dir)`.
-If cluttered, present move map to user (same flow as Init Step 2).
+If `result["clutter"]` is present and `status` is "cluttered", present move map to user (same flow as Init Step 2).
 
 ## Step 2: Directive + Features + Self-Assessment
 
@@ -192,15 +320,15 @@ Transition directly into work. No "session reconciled" message.
 5. Invoke `superpowers:test-driven-development` if soul purpose involves code.
 6. Invoke `superpowers:writing-plans` if soul purpose has 3+ steps.
 
-### Ralph Loop Invocation (Reconcile)
+### Ralph Loop Check (Reconcile)
 
-When `ralph_mode` from `read_context` is "automatic":
+Check if a Ralph Loop is already active:
 
 ```bash
 test -f ~/.claude/ralph-loop.local.md && echo "active" || echo "inactive"
 ```
 
-If inactive, invoke Ralph Loop using the same intensity table as Init mode.
+Note: Ralph Loop is no longer auto-invoked. User can manually start it with `/ralph-loop` if needed for iterative work.
 
 ---
 
@@ -210,35 +338,28 @@ If inactive, invoke Ralph Loop using the same intensity table as Init mode.
 
 Read `custom.md` if it exists, follow instructions under "During Settlement".
 
-## Step 1: Harvest + Promote
+## Step 1: Harvest + Promote + Feature Verification (composite)
 
-1. Call `session_harvest(project_dir)`.
-2. If promotable content exists, assess what to promote (decisions need rationale, patterns must be reusable, troubleshooting must have verified solutions). Present to user for approval.
-3. After approval, append promoted content to target files via Edit tool.
+1. Call `session_close(project_dir)` — returns combined harvest + features_read + hook_deactivate in ONE call.
+2. Extract `harvest = result["harvest"]`, `features = result["features"]`, `hook = result["hook"]`.
+3. If promotable content exists in `harvest`, assess what to promote (decisions need rationale, patterns must be reusable, troubleshooting must have verified solutions). Present to user for approval.
+4. After approval, append promoted content to target files via Edit tool.
+5. If pending features exist in `features`, run their proofs (shell commands, file checks).
+6. Update feature status in `CLAUDE-features.md`.
 
-## Step 2: Feature Verification
-
-1. Call `session_features_read(project_dir)`.
-2. If pending features exist, run their proofs (shell commands, file checks).
-3. Update feature status in `CLAUDE-features.md`.
-
-## Step 3: Code Review Gate
+## Step 2: Code Review Gate
 
 1. Invoke `superpowers:verification-before-completion` — run doubt review on recent changes.
 2. If critical issues found, present to user: "Fix issues first" / "Close anyway" / "Continue working".
 3. Invoke `superpowers:requesting-code-review` before PR creation.
 
-## Step 4: Deactivate Hook
-
-Call `session_hook_deactivate(project_dir)` — removes `.lifecycle-active.json`.
-
-## Step 5: PR Creation
+## Step 3: PR Creation
 
 1. Push current branch: `git push -u origin HEAD`
 2. Create PR: `gh pr create --title "..." --body "..."` with review summary.
 3. Return PR URL to user.
 
-## Step 6: Bounty Settlement (if bounty exists)
+## Step 4: Bounty Settlement (if bounty exists)
 
 1. Call `contract_run_tests(project_dir)` — execute all criteria.
 2. If tests pass, call `contract_submit(project_dir)`.
@@ -247,7 +368,7 @@ Call `session_hook_deactivate(project_dir)` — removes `.lifecycle-active.json`
 5. If verified: call `contract_settle(project_dir)`. Tell user tokens earned.
 6. If failed: present to user — "Fix and re-verify" / "Close anyway (forfeit)" / "Continue working".
 
-## Step 7: Archive + Cleanup
+## Step 5: Archive + Cleanup
 
 1. Call `session_archive(project_dir, OLD_PURPOSE, NEW_PURPOSE)` — archive soul purpose, reset active context.
 2. Remove Ralph Loop indicator: `rm -f ~/.claude/ralph-loop.local.md`

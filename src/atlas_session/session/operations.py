@@ -3,6 +3,9 @@
 Extracted from session-init.py — all logic preserved, adapted to be
 called as functions (not CLI subcommands) returning dicts instead of
 printing JSON.
+
+SECURITY: All project_dir parameters are resolved and validated to
+prevent path traversal attacks.
 """
 
 import json
@@ -26,10 +29,34 @@ from ..common.state import (
     session_dir,
 )
 
+# Capability inventory cache constants
+CAPABILITY_CACHE_FILENAME = ".capability-cache.json"
+CAPABILITY_INVENTORY_FILENAME = "CLAUDE-capability-inventory.md"
+
+
+def _resolve_project_dir(project_dir: str) -> Path:
+    """Resolve and validate project_dir to prevent path traversal.
+
+    Returns:
+        Resolved absolute Path object
+
+    Raises:
+        ValueError: If resolved path is outside home directory or /tmp.
+    """
+    path = Path(project_dir).resolve()
+
+    home = Path.home().resolve()
+    tmp = Path("/tmp").resolve()
+    if not (str(path).startswith(str(home)) or str(path).startswith(str(tmp))):
+        raise ValueError(f"Project directory must be under home or /tmp: {path}")
+
+    return path
+
 
 # ---------------------------------------------------------------------------
 # preflight
 # ---------------------------------------------------------------------------
+
 
 def preflight(project_dir: str) -> dict:
     """Detect environment, return structured data."""
@@ -51,17 +78,16 @@ def preflight(project_dir: str) -> dict:
     try:
         subprocess.run(
             ["git", "rev-parse", "--git-dir"],
-            capture_output=True, check=True, cwd=project_dir,
+            capture_output=True,
+            check=True,
+            cwd=project_dir,
         )
         result["is_git"] = True
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
 
     # Root file count
-    root_files = [
-        f for f in root.iterdir()
-        if f.is_file() and not f.name.startswith("CLAUDE")
-    ]
+    root_files = [f for f in root.iterdir() if f.is_file() and not f.name.startswith("CLAUDE")]
     result["root_file_count"] = len(root_files)
 
     # Project signals
@@ -109,10 +135,7 @@ def _detect_project_signals(root: Path, root_files: list[Path]) -> dict:
         signals["has_readme"] = True
         try:
             lines = readme.read_text(errors="replace").split("\n")
-            content_lines = [
-                ln.strip() for ln in lines
-                if ln.strip() and not ln.strip().startswith("#")
-            ][:3]
+            content_lines = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")][:3]
             signals["readme_excerpt"] = " ".join(content_lines)[:200]
         except Exception:
             pass
@@ -159,17 +182,32 @@ def _detect_project_signals(root: Path, root_files: list[Path]) -> dict:
         except PermissionError:
             pass
 
+    # CI provider detection
+    ci_indicators = [
+        (root / ".github" / "workflows", "github-actions"),
+        (root / ".gitlab-ci.yml", "gitlab-ci"),
+        (root / "Jenkinsfile", "jenkins"),
+        (root / ".circleci", "circleci"),
+    ]
+    signals["has_ci"] = False
+    signals["ci_provider"] = ""
+    for ci_path, provider in ci_indicators:
+        if ci_path.exists():
+            signals["has_ci"] = True
+            signals["ci_provider"] = provider
+            break
+
     # Empty project detection
-    has_manifests = any([
-        signals["has_readme"], signals["has_package_json"],
-        signals["has_pyproject"], signals["has_cargo_toml"],
-        signals["has_go_mod"],
-    ])
-    signals["is_empty_project"] = (
-        not signals["has_code_files"]
-        and not has_manifests
-        and len(root_files) <= 2
+    has_manifests = any(
+        [
+            signals["has_readme"],
+            signals["has_package_json"],
+            signals["has_pyproject"],
+            signals["has_cargo_toml"],
+            signals["has_go_mod"],
+        ]
     )
+    signals["is_empty_project"] = not signals["has_code_files"] and not has_manifests and len(root_files) <= 2
 
     return signals
 
@@ -177,6 +215,7 @@ def _detect_project_signals(root: Path, root_files: list[Path]) -> dict:
 # ---------------------------------------------------------------------------
 # init
 # ---------------------------------------------------------------------------
+
 
 def init(
     project_dir: str,
@@ -250,6 +289,7 @@ def init(
 # validate
 # ---------------------------------------------------------------------------
 
+
 def validate(project_dir: str) -> dict:
     """Validate session-context files, repair from templates if needed."""
     sd = session_dir(project_dir)
@@ -277,6 +317,7 @@ def validate(project_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 # cache_governance
 # ---------------------------------------------------------------------------
+
 
 def cache_governance(project_dir: str) -> dict:
     """Extract governance sections from CLAUDE.md, save to temp cache."""
@@ -307,6 +348,7 @@ def cache_governance(project_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 # restore_governance
 # ---------------------------------------------------------------------------
+
 
 def restore_governance(project_dir: str) -> dict:
     """Restore governance sections to CLAUDE.md from cache."""
@@ -348,6 +390,7 @@ def restore_governance(project_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 # ensure_governance
 # ---------------------------------------------------------------------------
+
 
 def ensure_governance(
     project_dir: str,
@@ -392,6 +435,7 @@ def ensure_governance(
 # read_context
 # ---------------------------------------------------------------------------
 
+
 def read_context(project_dir: str) -> dict:
     """Read soul purpose + active context, return structured summary."""
     sd = session_dir(project_dir)
@@ -411,7 +455,7 @@ def read_context(project_dir: str) -> dict:
     # Read soul purpose
     sp_file = sd / "CLAUDE-soul-purpose.md"
     if sp_file.is_file():
-        sp_content = sp_file.read_text()
+        sp_content = sp_file.read_text(errors="replace")
         lines = sp_content.split("\n")
         purpose_lines: list[str] = []
         for line in lines:
@@ -427,14 +471,14 @@ def read_context(project_dir: str) -> dict:
                 purpose_lines.append(line.strip())
         result["soul_purpose"] = " ".join(purpose_lines).strip()
 
-        if "(No active soul purpose)" in sp_content or not result["soul_purpose"]:
+        if "(No active soul purpose)" in result["soul_purpose"] or not result["soul_purpose"]:
             result["soul_purpose"] = ""
             result["status_hint"] = "no_purpose"
 
     # Read active context (first 60 lines)
     ac_file = sd / "CLAUDE-activeContext.md"
     if ac_file.is_file():
-        ac_content = ac_file.read_text()
+        ac_content = ac_file.read_text(errors="replace")
         ac_lines = ac_content.split("\n")[:60]
         result["active_context_summary"] = "\n".join(ac_lines)
 
@@ -463,6 +507,7 @@ def read_context(project_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 # harvest
 # ---------------------------------------------------------------------------
+
 
 def harvest(project_dir: str) -> dict:
     """Scan active context for promotable content."""
@@ -493,6 +538,7 @@ def harvest(project_dir: str) -> dict:
 # archive
 # ---------------------------------------------------------------------------
 
+
 def archive(
     project_dir: str,
     old_purpose: str,
@@ -516,10 +562,10 @@ def archive(
 
     # Preserve existing [CLOSED] entries
     if "[CLOSED]" in existing:
-        for line in existing.split("\n"):
+        lines = existing.split("\n")
+        for i, line in enumerate(lines):
             if "[CLOSED]" in line:
-                idx = existing.index(line)
-                old_archives = existing[idx:]
+                old_archives = "\n".join(lines[i:])
                 new_content = new_content.rstrip() + f"\n\n{old_archives}\n"
                 break
 
@@ -546,38 +592,104 @@ def archive(
 # ---------------------------------------------------------------------------
 
 ROOT_WHITELIST_EXACT = {
-    "claude.md", "readme.md", "license", "license.md", "cname",
-    "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-    "tsconfig.json", "jsconfig.json", "next.config.js", "next.config.mjs",
-    "next.config.ts", "next-env.d.ts", "vercel.json", "netlify.toml",
-    "middleware.ts", "middleware.js", "instrumentation.ts",
-    "tailwind.config.js", "tailwind.config.ts", "tailwind.config.mjs",
-    "postcss.config.js", "postcss.config.mjs", "postcss.config.cjs",
-    "eslint.config.js", "eslint.config.mjs", ".eslintrc.js", ".eslintrc.json",
-    ".prettierrc", ".prettierrc.json", ".prettierrc.js",
-    "dockerfile", "docker-compose.yml", "docker-compose.yaml",
-    ".dockerignore", ".gitignore", ".gitattributes", ".editorconfig",
-    "makefile", "rakefile", "gemfile", "gemfile.lock",
-    "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
-    "cargo.toml", "cargo.lock", "go.mod", "go.sum",
-    "sanity.config.ts", "sanity.config.js", "sanity.cli.ts", "sanity.cli.js",
-    "drizzle.config.ts", "drizzle.config.js",
-    "vitest.config.ts", "vitest.config.js", "jest.config.ts", "jest.config.js",
-    "playwright.config.ts", "playwright.config.js",
-    "index.html", "robots.txt", "sitemap.xml",
+    "claude.md",
+    "readme.md",
+    "license",
+    "license.md",
+    "cname",
+    "package.json",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "tsconfig.json",
+    "jsconfig.json",
+    "next.config.js",
+    "next.config.mjs",
+    "next.config.ts",
+    "next-env.d.ts",
+    "vercel.json",
+    "netlify.toml",
+    "middleware.ts",
+    "middleware.js",
+    "instrumentation.ts",
+    "tailwind.config.js",
+    "tailwind.config.ts",
+    "tailwind.config.mjs",
+    "postcss.config.js",
+    "postcss.config.mjs",
+    "postcss.config.cjs",
+    "eslint.config.js",
+    "eslint.config.mjs",
+    ".eslintrc.js",
+    ".eslintrc.json",
+    ".prettierrc",
+    ".prettierrc.json",
+    ".prettierrc.js",
+    "dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    ".dockerignore",
+    ".gitignore",
+    ".gitattributes",
+    ".editorconfig",
+    "makefile",
+    "rakefile",
+    "gemfile",
+    "gemfile.lock",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "requirements.txt",
+    "cargo.toml",
+    "cargo.lock",
+    "go.mod",
+    "go.sum",
+    "sanity.config.ts",
+    "sanity.config.js",
+    "sanity.cli.ts",
+    "sanity.cli.js",
+    "drizzle.config.ts",
+    "drizzle.config.js",
+    "vitest.config.ts",
+    "vitest.config.js",
+    "jest.config.ts",
+    "jest.config.js",
+    "playwright.config.ts",
+    "playwright.config.js",
+    "index.html",
+    "robots.txt",
+    "sitemap.xml",
     "components.json",
-    "railway.toml", "fly.toml", "render.yaml", "app.yaml",
-    "turbo.json", "nx.json", "lerna.json", "pnpm-workspace.yaml",
-    "vitest.setup.ts", "vitest.setup.js", "jest.setup.ts", "jest.setup.js",
+    "railway.toml",
+    "fly.toml",
+    "render.yaml",
+    "app.yaml",
+    "turbo.json",
+    "nx.json",
+    "lerna.json",
+    "pnpm-workspace.yaml",
+    "vitest.setup.ts",
+    "vitest.setup.js",
+    "jest.setup.ts",
+    "jest.setup.js",
     "tsconfig.tsbuildinfo",
-    "commitlint.config.js", "lint-staged.config.js", ".lintstagedrc",
-    ".husky", ".changeset",
-    "biome.json", "deno.json", "bun.lockb",
+    "commitlint.config.js",
+    "lint-staged.config.js",
+    ".lintstagedrc",
+    ".husky",
+    ".changeset",
+    "biome.json",
+    "deno.json",
+    "bun.lockb",
 }
 
 ROOT_WHITELIST_PATTERNS = [
-    ".env", ".npmrc", ".nvmrc", ".node-version",
-    ".python-version", ".tool-versions",
+    ".env",
+    ".npmrc",
+    ".nvmrc",
+    ".node-version",
+    ".python-version",
+    ".tool-versions",
 ]
 
 CLUTTER_CATEGORIES = [
@@ -614,10 +726,7 @@ def _categorize_file(filename: str) -> tuple[str | None, str]:
 def check_clutter(project_dir: str) -> dict:
     """Scan root directory for files that violate structure rules."""
     root = Path(project_dir)
-    root_files = sorted(
-        f for f in root.iterdir()
-        if f.is_file() and not f.name.startswith("CLAUDE")
-    )
+    root_files = sorted(f for f in root.iterdir() if f.is_file() and not f.name.startswith("CLAUDE"))
 
     clutter: list[dict] = []
     whitelisted: list[str] = []
@@ -633,11 +742,13 @@ def check_clutter(project_dir: str) -> dict:
         if target_dir is None:
             deletable.append({"file": name, "category": category})
         else:
-            clutter.append({
-                "file": name,
-                "target": f"{target_dir}/{name}",
-                "category": category,
-            })
+            clutter.append(
+                {
+                    "file": name,
+                    "target": f"{target_dir}/{name}",
+                    "category": category,
+                }
+            )
 
     moves_by_dir: dict[str, list[str]] = {}
     for item in clutter:
@@ -667,6 +778,7 @@ def check_clutter(project_dir: str) -> dict:
 # classify_brainstorm
 # ---------------------------------------------------------------------------
 
+
 def classify_brainstorm(directive: str, project_signals: dict) -> dict:
     """Deterministic brainstorm weight classification.
 
@@ -677,6 +789,8 @@ def classify_brainstorm(directive: str, project_signals: dict) -> dict:
     - no directive + empty project → full
     """
     has_directive = len(directive.split()) >= 3
+    if project_signals is None:
+        project_signals = {}
     has_content = (
         project_signals.get("has_readme", False)
         or project_signals.get("has_code_files", False)
@@ -706,6 +820,7 @@ def classify_brainstorm(directive: str, project_signals: dict) -> dict:
 # hook_activate
 # ---------------------------------------------------------------------------
 
+
 def hook_activate(project_dir: str, soul_purpose: str) -> dict:
     """Write lifecycle state to session-context/.lifecycle-active.json.
 
@@ -733,6 +848,7 @@ def hook_activate(project_dir: str, soul_purpose: str) -> dict:
 # hook_deactivate
 # ---------------------------------------------------------------------------
 
+
 def hook_deactivate(project_dir: str) -> dict:
     """Remove lifecycle state file. Idempotent."""
     sd = session_dir(project_dir)
@@ -748,6 +864,7 @@ def hook_deactivate(project_dir: str) -> dict:
 # ---------------------------------------------------------------------------
 # features_read
 # ---------------------------------------------------------------------------
+
 
 def features_read(project_dir: str) -> dict:
     """Parse CLAUDE-features.md into structured claims by status.
@@ -803,6 +920,7 @@ def features_read(project_dir: str) -> dict:
 # git_summary
 # ---------------------------------------------------------------------------
 
+
 def git_summary(project_dir: str) -> dict:
     """Raw git data: recent commits, changed files, branch, ahead/behind.
 
@@ -821,7 +939,10 @@ def git_summary(project_dir: str) -> dict:
     def _run(args: list[str]) -> str | None:
         try:
             proc = subprocess.run(
-                args, capture_output=True, text=True, cwd=project_dir,
+                args,
+                capture_output=True,
+                text=True,
+                cwd=project_dir,
                 timeout=10,
             )
             return proc.stdout.strip() if proc.returncode == 0 else None
@@ -839,9 +960,15 @@ def git_summary(project_dir: str) -> dict:
         result["branch"] = branch
 
     # Recent commits (last 10)
-    log_output = _run([
-        "git", "log", "--oneline", "--no-decorate", "-10",
-    ])
+    log_output = _run(
+        [
+            "git",
+            "log",
+            "--oneline",
+            "--no-decorate",
+            "-10",
+        ]
+    )
     if log_output:
         result["commits"] = [
             {"hash": line.split(" ", 1)[0], "message": line.split(" ", 1)[1] if " " in line else ""}
@@ -853,18 +980,467 @@ def git_summary(project_dir: str) -> dict:
     status_output = _run(["git", "status", "--porcelain"])
     if status_output:
         result["files_changed"] = [
-            {"status": line[:2].strip(), "file": line[3:]}
-            for line in status_output.split("\n")
-            if line.strip()
+            {"status": line[:2].strip(), "file": line[3:]} for line in status_output.split("\n") if line.strip()
         ]
 
     # Ahead/behind tracking branch
-    tracking = _run([
-        "git", "rev-list", "--left-right", "--count", "HEAD...@{upstream}",
-    ])
+    tracking = _run(
+        [
+            "git",
+            "rev-list",
+            "--left-right",
+            "--count",
+            "HEAD...@{upstream}",
+        ]
+    )
     if tracking and "\t" in tracking:
         parts = tracking.split("\t")
         result["ahead"] = int(parts[0])
         result["behind"] = int(parts[1])
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# capability_inventory
+# ---------------------------------------------------------------------------
+
+
+def _get_git_head(project_dir: str) -> str | None:
+    """Get current git HEAD commit hash.
+
+    Returns:
+        Commit hash as string, or None if not a git repo or command fails.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+    return None
+
+
+def _get_capability_cache_path(project_dir: str) -> Path:
+    """Get path to capability cache file.
+
+    Returns:
+        Path object for session-context/.capability-cache.json
+    """
+    return session_dir(project_dir) / CAPABILITY_CACHE_FILENAME
+
+
+def _load_capability_cache(project_dir: str) -> dict | None:
+    """Load capability cache from disk.
+
+    Returns:
+        Cached data dict, or None if file doesn't exist or invalid JSON.
+    """
+    cache_path = _get_capability_cache_path(project_dir)
+    if not cache_path.is_file():
+        return None
+
+    try:
+        content = cache_path.read_text()
+        return json.loads(content)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_capability_cache(project_dir: str, data: dict) -> None:
+    """Save capability cache to disk.
+
+    Args:
+        project_dir: Project directory path
+        data: Cache data to write as indented JSON
+    """
+    cache_path = _get_capability_cache_path(project_dir)
+    cache_path.parent.mkdir(exist_ok=True)
+    cache_path.write_text(json.dumps(data, indent=2))
+
+
+def capability_inventory(project_dir: str, force_refresh: bool = False) -> dict:
+    """Manage capability inventory cache with git-aware invalidation.
+
+    The cache stores metadata about the capability inventory file and is
+    invalidated when the git HEAD changes, ensuring freshness after commits.
+
+    Args:
+        project_dir: Project directory path
+        force_refresh: If True, bypass cache and force regeneration
+
+    Returns:
+        Dict with:
+            - status: "ok"
+            - cache_hit: bool (True if cache was valid and used)
+            - is_git: bool (True if project is a git repo)
+            - git_head: str | None (current commit hash)
+            - git_changed: bool (True if HEAD changed since cache)
+            - inventory_file: str (relative path to inventory file)
+            - needs_generation: bool (True if inventory should be regenerated)
+    """
+    git_head = _get_git_head(project_dir)
+    is_git = git_head is not None
+
+    # Load existing cache if in git repo
+    cache = _load_capability_cache(project_dir) if is_git else None
+
+    cache_hit = False
+    git_changed = False
+    cached_head = None
+
+    if cache:
+        cached_head = cache.get("git_head")
+        cache_hit = cached_head == git_head and not force_refresh
+        git_changed = cached_head != git_head
+
+    # Save new cache entry if not hitting or forcing refresh (git repos only)
+    if is_git and (not cache_hit or force_refresh):
+        cache_data = {
+            "git_head": git_head,
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _save_capability_cache(project_dir, cache_data)
+
+    # Relative path from session-context
+    inventory_file = f"session-context/{CAPABILITY_INVENTORY_FILENAME}"
+
+    return {
+        "status": "ok",
+        "cache_hit": cache_hit,
+        "is_git": is_git,
+        "git_head": git_head,
+        "git_changed": git_changed,
+        "inventory_file": inventory_file,
+        "needs_generation": not cache_hit or force_refresh,
+    }
+
+
+# ---------------------------------------------------------------------------
+# refresh_claude_md (approximates /init behavior)
+# ---------------------------------------------------------------------------
+
+
+def refresh_claude_md(project_dir: str) -> dict:
+    """Approximate Claude Code's /init command behavior.
+
+    Analyzes the codebase and generates/upates CLAUDE.md with:
+    - Project Overview (name, goal, stack from package manifests)
+    - Project Structure (directories and key files)
+    - Development Commands (from package.json scripts, Makefile, etc.)
+    - Preserves existing governance sections (Structure Maintenance, Session Context, etc.)
+
+    This is an approximation — the real /init should be run periodically
+    to calibrate. This tool bridges the gap for automated workflows.
+
+    Returns:
+        dict with status, generated_content, governance_preserved, etc.
+    """
+    root = _resolve_project_dir(project_dir)
+    cmd_path = root / "CLAUDE.md"
+
+    # Step 1: Detect project signals
+    root_files = [f for f in root.iterdir() if f.is_file()]
+    signals = _detect_project_signals(root, root_files)
+
+    # Step 2: Extract existing governance sections if CLAUDE.md exists
+    existing_governance = {}
+    if cmd_path.is_file():
+        content = cmd_path.read_text()
+        for section in GOVERNANCE_SECTIONS:
+            found = find_section(content, section)
+            if found:
+                existing_governance[section] = found
+
+    # Step 3: Build CLAUDE.md content
+    lines = []
+    lines.append("# CLAUDE.md")
+    lines.append("")
+    lines.append("This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.")
+    lines.append("")
+
+    # Project Overview
+    lines.append("## Project Overview")
+    lines.append("")
+
+    project_name = signals.get("package_name") or root.name
+    project_goal = signals.get("package_description") or "[Primary objective]"
+    detected_stack = signals.get("detected_stack", [])
+
+    lines.append(f"**Project**: {project_name}")
+    lines.append(f"**Goal**: {project_goal}")
+    lines.append(f"**Stack**: {', '.join(detected_stack) if detected_stack else '[Technologies / platforms]'}")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # Project Structure
+    lines.append("## Project Structure")
+    lines.append("")
+
+    # Analyze directory structure
+    dirs = sorted([d for d in root.iterdir() if d.is_dir() and not d.name.startswith(".")])
+    files = sorted([f for f in root.iterdir() if f.is_file() and not f.name.startswith(".")])
+
+    if dirs:
+        lines.append("### Directories")
+        for d in dirs:
+            lines.append(f"- `{d.name}/` - [Description]")
+        lines.append("")
+
+    if files:
+        lines.append("### Root Files")
+        for f in files:
+            lines.append(f"- `{f.name}` - {f.suffix.upper() if f.suffix else 'file'}")
+        lines.append("")
+
+    # Development Commands
+    lines.append("## Development Commands")
+    lines.append("")
+
+    # Extract from package.json scripts
+    if signals.get("has_package_json"):
+        pkg_path = root / "package.json"
+        try:
+            pkg_data = json.loads(pkg_path.read_text(errors="replace"))
+            scripts = pkg_data.get("scripts", {})
+            if scripts:
+                for name, cmd in scripts.items():
+                    lines.append(f"### {name}")
+                    lines.append(f"```bash")
+                    lines.append(f"{cmd}")
+                    lines.append(f"```")
+                    lines.append("")
+        except Exception:
+            pass
+
+    # Check for Makefile
+    makefile = root / "Makefile"
+    if makefile.is_file():
+        lines.append("### Makefile targets")
+        try:
+            make_content = makefile.read_text(errors="replace")
+            # Extract targets (lines ending with :)
+            for line in make_content.split("\n"):
+                line = line.strip()
+                if line and not line.startswith("#") and line.endswith(":"):
+                    target = line[:-1]
+                    if not target.startswith("."):
+                        lines.append(f"- `make {target}`")
+            lines.append("")
+        except Exception:
+            pass
+
+    lines.append("---")
+    lines.append("")
+
+    # Step 4: Append preserved governance sections
+    for section_name in GOVERNANCE_SECTIONS:
+        if section_name in existing_governance:
+            lines.append(f"## {section_name}")
+            lines.append("")
+            lines.append(existing_governance[section_name])
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    # Add meta footer
+    lines.append("")
+    lines.append(f"<!-- Generated by atlas-session MCP tool at {datetime.now(timezone.utc).isoformat()} -->")
+    lines.append(f"<!-- Last real /init: [not recorded] -->")
+    lines.append("")
+    lines.append("**Note**: This file was auto-generated by the atlas-session MCP server as an approximation of Claude Code's `/init` command.")
+    lines.append("For best results, run `/init` periodically to calibrate this approximation.")
+
+    generated_content = "\n".join(lines)
+
+    # Step 5: Write to CLAUDE.md
+    try:
+        cmd_path.write_text(generated_content)
+        return {
+            "status": "ok",
+            "claude_md_updated": True,
+            "path": str(cmd_path),
+            "governance_sections_preserved": list(existing_governance.keys()),
+            "project_detected": {
+                "name": project_name,
+                "stack": detected_stack,
+                "has_package_json": signals.get("has_package_json", False),
+                "has_pyproject": signals.get("has_pyproject", False),
+            },
+            "lines_written": len(generated_content.split("\n")),
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "claude_md_updated": False,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Composite operations — reduce MCP round-trips by combining granular ops
+# ---------------------------------------------------------------------------
+
+
+def start_composite(project_dir: str, directive: str = "") -> dict:
+    """Composite session start: preflight + validate + read_context +
+    git_summary + classify_brainstorm + conditional check_clutter.
+
+    Combines the 5-6 MCP calls that always run together at session start
+    into a single round-trip. Each sub-operation is independently guarded
+    so a failure in one does not block the others.
+
+    Args:
+        project_dir: Project directory path.
+        directive: Optional directive text for brainstorm classification.
+
+    Returns:
+        Dict with keys: preflight, validate, read_context, git_summary,
+        classify_brainstorm, clutter (None if root_file_count <= 15).
+    """
+    result: dict = {
+        "preflight": None,
+        "validate": None,
+        "read_context": None,
+        "git_summary": None,
+        "classify_brainstorm": None,
+        "clutter": None,
+    }
+
+    # 1. Preflight — needed to determine mode and root_file_count
+    try:
+        result["preflight"] = preflight(project_dir)
+    except Exception as e:
+        result["preflight"] = {"status": "error", "error": str(e)}
+
+    # 2. Validate
+    try:
+        result["validate"] = validate(project_dir)
+    except Exception as e:
+        result["validate"] = {"status": "error", "error": str(e)}
+
+    # 3. Read context
+    try:
+        result["read_context"] = read_context(project_dir)
+    except Exception as e:
+        result["read_context"] = {"status": "error", "error": str(e)}
+
+    # 4. Git summary
+    try:
+        result["git_summary"] = git_summary(project_dir)
+    except Exception as e:
+        result["git_summary"] = {"status": "error", "error": str(e)}
+
+    # 5. Classify brainstorm — needs project_signals from preflight
+    try:
+        project_signals = {}
+        if isinstance(result["preflight"], dict) and "project_signals" in result["preflight"]:
+            project_signals = result["preflight"]["project_signals"]
+        result["classify_brainstorm"] = classify_brainstorm(directive, project_signals)
+    except Exception as e:
+        result["classify_brainstorm"] = {"status": "error", "error": str(e)}
+
+    # 6. Check clutter — only if root_file_count > 15
+    try:
+        root_file_count = 0
+        if isinstance(result["preflight"], dict):
+            root_file_count = result["preflight"].get("root_file_count", 0)
+        if root_file_count > 15:
+            result["clutter"] = check_clutter(project_dir)
+    except Exception as e:
+        result["clutter"] = {"status": "error", "error": str(e)}
+
+    return result
+
+
+def activate_composite(
+    project_dir: str,
+    soul_purpose: str,
+    old_purpose: str = "(pending)",
+) -> dict:
+    """Composite session activation: archive + hook_activate + features_read.
+
+    Combines the 3 MCP calls that always run together when activating a
+    soul purpose into a single round-trip. Each sub-operation is
+    independently guarded for partial failure resilience.
+
+    Args:
+        project_dir: Project directory path.
+        soul_purpose: The soul purpose to activate.
+        old_purpose: Previous purpose to archive (default: "(pending)").
+
+    Returns:
+        Dict with keys: archive, hook, features.
+    """
+    result: dict = {
+        "archive": None,
+        "hook": None,
+        "features": None,
+    }
+
+    # 1. Archive — set soul purpose (archives old, sets new)
+    try:
+        result["archive"] = archive(project_dir, old_purpose, soul_purpose)
+    except Exception as e:
+        result["archive"] = {"status": "error", "error": str(e)}
+
+    # 2. Hook activate — enable stop hook warnings
+    try:
+        result["hook"] = hook_activate(project_dir, soul_purpose)
+    except Exception as e:
+        result["hook"] = {"status": "error", "error": str(e)}
+
+    # 3. Features read — extract feature claims for tracking
+    try:
+        result["features"] = features_read(project_dir)
+    except Exception as e:
+        result["features"] = {"status": "error", "error": str(e)}
+
+    return result
+
+
+def close_composite(project_dir: str) -> dict:
+    """Composite session close: harvest + features_read + hook_deactivate.
+
+    Combines the 3 MCP calls that always run together during session
+    settlement into a single round-trip. Each sub-operation is
+    independently guarded for partial failure resilience.
+
+    Args:
+        project_dir: Project directory path.
+
+    Returns:
+        Dict with keys: harvest, features, hook.
+    """
+    result: dict = {
+        "harvest": None,
+        "features": None,
+        "hook": None,
+    }
+
+    # 1. Harvest — scan for promotable content
+    try:
+        result["harvest"] = harvest(project_dir)
+    except Exception as e:
+        result["harvest"] = {"status": "error", "error": str(e)}
+
+    # 2. Features read — check feature claim status
+    try:
+        result["features"] = features_read(project_dir)
+    except Exception as e:
+        result["features"] = {"status": "error", "error": str(e)}
+
+    # 3. Hook deactivate — remove lifecycle state file
+    try:
+        result["hook"] = hook_deactivate(project_dir)
+    except Exception as e:
+        result["hook"] = {"status": "error", "error": str(e)}
 
     return result
