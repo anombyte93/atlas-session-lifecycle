@@ -55,7 +55,148 @@ The skill NEVER finishes with "ready to go" and stops. After setup, immediately 
 
 > Triggered when `session_start` returns `preflight.mode == "init"`.
 
-## Step 1: Preflight + Assessment (composite)
+## Step 1: Quick Task Check
+
+Call `TaskList` immediately — before any file reads or MCP calls.
+
+- Tasks found → set `CURRENT_TASK` = first `in_progress` task, or first `pending` if none in progress
+- No tasks → set `CURRENT_TASK` = null (fresh start)
+
+Instant. No MCP calls. No file reads.
+
+## Step 2: /init Freshness Check
+
+1. Read `session-context/.last-init`:
+   - **Missing** → prompt and wait (see below)
+   - **Exists** → parse timestamp; if not from today → prompt and wait
+   - **Fresh (today)** → continue silently
+2. **If stale or missing**, tell the user:
+   > "CLAUDE.md needs refreshing. Please run `/init` now — I'll wait."
+   Wait for the user to confirm `/init` completed.
+3. Write current ISO timestamp to `session-context/.last-init`.
+
+**Why**: `/init` refreshes CLAUDE.md from the project config. Without it, the AI operates on stale instructions.
+
+## Step 3: Targeted Context Loading
+
+Read only what's needed:
+
+1. Always read:
+   - `session-context/CLAUDE-activeContext.md`
+   - `session-context/CLAUDE-soul-purpose.md`
+2. If `CURRENT_TASK` is set → scan active context for task-relevant sections only
+3. If `CURRENT_TASK` is null → read full active context
+
+No agents. Direct file reads only. Fast.
+
+## Step 4: Additional Context (conditional)
+
+Assess whether Step 3 gave a clear enough picture:
+
+- **Context files missing or clearly stale** → call `session_start(project_dir, DIRECTIVE)` now — store result, skip Step 7
+- **Context clear** → skip MCP calls; proceed to Step 5
+
+## Step 5: File Organization
+
+### 5a. Project Structure Config
+
+Check `config/project-structure.json`:
+
+**Not found** (first `/start` for this project):
+1. Detect project type from root files:
+   - `package.json` → Node.js
+   - `pyproject.toml` or `setup.py` → Python
+   - `go.mod` → Go
+   - `Cargo.toml` → Rust
+   - Fallback → Generic
+2. Generate structure config using defaults below
+3. Write to `config/project-structure.json`
+
+**Found** → load and apply existing config
+
+**Project Type Directory Defaults**
+
+| Type | Directories |
+|------|------------|
+| Python | `src/`, `tests/`, `docs/`, `scripts/`, `config/` |
+| Node.js | `src/`, `tests/`, `docs/`, `scripts/`, `config/` |
+| Go | `cmd/`, `internal/`, `pkg/`, `docs/`, `scripts/`, `config/` |
+| Rust | `src/`, `tests/`, `docs/`, `examples/`, `config/` |
+| Generic | `src/`, `tests/`, `docs/`, `scripts/`, `config/` |
+
+### 5b. Root Cleanup
+
+Scan project root against config rules:
+- Identify misplaced files (scripts at root, `.md` docs at root, config files at root, etc.)
+- If misplaced files found:
+  - Present: "Organising [N] files into project structure. Proceed?" [Yes / Show details / Skip]
+  - If approved: execute moves via `git mv` (if `is_git`) or file operations — silently
+- If root is clean → continue silently
+
+## Step 6: Chezmoi Tracking
+
+Ensure project artifacts deployed to `~/.claude/` are tracked by chezmoi. Untracked = invisible to chezmoi = lost on machine rebuild.
+
+**Guard first**: check `command -v chezmoi`. If chezmoi is not installed, skip this entire step silently and continue to Step 7.
+
+Also skip this step if the project has no `skills/` directory (nothing to track for non-skill projects).
+
+### 6a. Detect Installed Artifacts
+
+Scan for deployed files that chezmoi should own:
+
+1. **Skills**: for each `skills/<name>/` directory in this project:
+   - Target: `~/.claude/skills/<name>/SKILL.md`
+   - If that file exists on disk → candidate for tracking
+
+2. **Python backend**: if `scripts/session-init.py` exists in this project:
+   - Target: `~/.claude/skills/start/session-init.py`
+   - If that file exists on disk → candidate for tracking
+
+3. **MCP server code**: if the directory `~/.claude/skills/start/src/` exists on disk:
+   - Target: `~/.claude/skills/start/src/` (entire directory)
+   - If that directory exists on disk → candidate for tracking
+
+Skip any file or directory that doesn't exist on disk (not yet installed).
+
+### 6b. Check + Add
+
+For each candidate artifact, check if chezmoi manages it:
+
+```bash
+# Check if managed (exits 0 with a match if tracked; no output if not tracked)
+chezmoi managed --include files --path-style absolute | grep -qF "$target_path"
+```
+
+- **Not in managed list** → untracked: run `chezmoi add "$target_path"`
+- **In managed list** → tracked: run `chezmoi status "$target_path"` and check the output:
+  - Any non-whitespace output (e.g. `MM`, ` M`, `M `) → **drift**: add to drift list, do NOT auto-apply
+  - Empty output (exit 0, no output) → **clean**: skip
+
+For a directory target (e.g. `~/.claude/skills/start/src/`), use `chezmoi add` on the directory — it recurses by default.
+
+### 6c. Commit if anything was added
+
+If any `chezmoi add` calls were made:
+
+```bash
+# project_dir is the absolute path to the current project (e.g. $(pwd) at init start)
+chezmoi git -- add -A
+chezmoi git -- commit -m "track: $(basename "$project_dir") skill artifacts"
+```
+
+`$project_dir` is the absolute project path established at init start (the directory Claude Code was invoked from). Use `basename` to extract just the folder name (e.g. `Soul_Purpose_Skill` from `/home/user/projects/Soul_Purpose_Skill`).
+
+### 6d. Drift notification (if drift found)
+
+If any tracked files showed non-empty output from `chezmoi status`:
+> "Chezmoi drift detected in [list of files]. Run /chezmoi-drift-cleanup when ready."
+
+Do NOT block init. Continue to Step 7.
+
+## Step 7: Preflight + Assessment (composite)
+
+Skip this step if `session_start` was already called in Step 4 — reuse that result.
 
 **MCP AVAILABILITY** — assume atlas-session is available (do NOT run `claude mcp list`):
 
@@ -72,28 +213,22 @@ The skill NEVER finishes with "ready to go" and stops. After setup, immediately 
    Do NOT proceed with any other steps if session_start fails.
 3. Extract results: `preflight = result["preflight"]`, `read_context = result["read_context"]`, `git_summary = result["git_summary"]`, `classify_brainstorm = result["classify_brainstorm"]`, `clutter = result["clutter"]`.
 
-## Step 2: Brainstorm Weight + File Organization
+## Step 8: Brainstorm Weight
 
-1. Extract `BRAINSTORM_WEIGHT` from `result["classify_brainstorm"]["weight"]` for Step 4.
+Extract `BRAINSTORM_WEIGHT` from `result["classify_brainstorm"]["weight"]` for use in Step 10.
 
-**File organization** (only if `result["clutter"]` is present and `status` is "cluttered"):
-
-Present the grouped move map from `result["clutter"]`:
-- "Your project root has [N] misplaced files. Proposed cleanup: [summary]. Approve?"
-- Options: "Yes, clean up", "Show details first", "Skip"
-- If approved, execute moves via `git mv` (if `is_git`) or file operations.
-
-## Step 3: Silent Bootstrap + CI/CD Detection
+## Step 9: Silent Bootstrap + CI/CD Detection
 
 1. Call `session_init(project_dir, DIRECTIVE_OR_PENDING)`
 2. Call `session_ensure_governance(project_dir)`
 3. Call `session_cache_governance(project_dir)`
-4. Run `/init` (Claude Code built-in — refreshes CLAUDE.md. Must run in main thread.)
-5. Call `session_restore_governance(project_dir)`
+4. Call `session_restore_governance(project_dir)`
+
+Note: `/init` was already prompted in Step 2 — do not run it again here.
 
 **CI/CD Scaffold Detection** (smart, zero-friction):
 
-Use `project_signals` from `result["preflight"]` (already available from Step 1).
+Use `project_signals` from `result["preflight"]` (available from Step 7).
 
 Determine CI/CD action based on these rules:
 
@@ -135,9 +270,9 @@ Use language-specific defaults:
 | Go | `go test ./... -v -race` | (empty) | `go mod download` |
 | Rust | `cargo test --verbose` | `cargo build --verbose` | (empty) |
 
-6. Read `custom.md` if it exists, follow instructions under "During Init".
+**After all CI/CD steps**: Read `custom.md` if it exists, follow instructions under "During Init".
 
-## Step 4: Quick Clarify + Activate + Continuation
+## Step 10: Quick Clarify + Activate + Continuation
 
 **Quick Clarify runs first (always)**:
 
@@ -157,6 +292,23 @@ Call `contract_health()`. If healthy, call `contract_create(project_dir, DERIVED
 Default escrow: 100. Increase for complex soul purposes at AI's discretion.
 
 If AtlasCoin is down, tell user and continue without bounty.
+
+### Task Decomposition (MANDATORY for 2+ step soul purposes)
+
+After bounty creation (or if AtlasCoin unavailable):
+
+1. Count discrete steps in the soul purpose. Use these signals:
+   - Soul purpose contains "and" connecting distinct actions
+   - quick-clarify returned Medium or Large
+   - Soul purpose has an explicit numbered sequence (1. X, 2. Y)
+   - Soul purpose contains 2+ different verbs of action
+
+2. If 2+ discrete steps → create a task per step:
+   `TaskCreate(subject: "[imperative step]", description: "[context + acceptance criteria]", activeForm: "[present continuous]")`
+
+3. If single task (Small / single verb) → skip `TaskCreate`. Don't add overhead.
+
+4. Mark the first task as in_progress immediately.
 
 ### Before Starting Work (MANDATORY)
 
@@ -251,6 +403,20 @@ Before any assessment, save the current session state so context files reflect r
 
 ## Step 1: Silent Assessment + Context Reality Check (composite)
 
+### Quick Resume Check (TaskList first)
+
+Before any MCP analysis:
+
+1. Call `TaskList`
+2. If pending or in_progress tasks exist:
+   - Surface to user as: "Resuming: [first in_progress or next pending task]"
+   - Skip `session_features_read` analysis — tasks ARE the pending work list
+   - Proceed directly to Step 4 continuation with the next pending task
+3. If `TaskList` is empty:
+   - Check if `session-context/CLAUDE-tasks.md` exists and has unchecked items
+   - If yes → re-emit pending/in_progress tasks via `TaskCreate`, then proceed normally
+   - If no → fall through to existing MCP analysis below
+
 **MCP AVAILABILITY** — assume atlas-session is available (do NOT run `claude mcp list`):
 
 1. Call `session_start(project_dir, DIRECTIVE)` — returns combined assessment in one call.
@@ -269,7 +435,7 @@ Before any assessment, save the current session state so context files reflect r
 
 ### Root Cleanup
 
-If `result["clutter"]` is present and `status` is "cluttered", present move map to user (same flow as Init Step 2).
+If `result["clutter"]` is present and `status` is "cluttered", present move map to user (same flow as Init Step 5b).
 
 ## Step 2: Directive + Features + Self-Assessment
 
@@ -381,7 +547,7 @@ Read `custom.md` if it exists, follow instructions under "During Settlement".
 > Create or edit `custom.md` in the plugin root directory.
 
 The AI reads `custom.md` at each lifecycle phase:
-- **During Init**: After session-context is bootstrapped (Step 3)
+- **During Init**: After session-context is bootstrapped (Step 9)
 - **During Reconcile**: After read-context, before assessment (Step 1)
 - **During Settlement**: Before harvest + archive (Settlement Step 1)
 - **Always**: Applied in all modes
