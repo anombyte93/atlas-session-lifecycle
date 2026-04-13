@@ -111,9 +111,20 @@ def register(mcp: FastMCP) -> None:
 
     @mcp.tool
     def session_hook_deactivate(project_dir: str) -> dict:
-        """Remove lifecycle state file. Idempotent. Call during
-        settlement or session close."""
+        """Tombstone the lifecycle state file (active=false, state=closed,
+        closed_at=now). Previously this deleted the file; now it preserves
+        history so fleet audits can see closed sessions. Idempotent."""
         return ops.hook_deactivate(project_dir)
+
+    @mcp.tool
+    def session_hook_touch_sync(
+        project_dir: str,
+        soul_purpose: str = "",
+    ) -> dict:
+        """Update last_sync_at on the lifecycle file. Called by /sync.
+        Creates a minimal v2 lifecycle file if one does not exist
+        (backward compat for sessions started before last_sync_at shipped)."""
+        return ops.hook_touch_sync(project_dir, soul_purpose)
 
     @mcp.tool
     def session_features_read(project_dir: str) -> dict:

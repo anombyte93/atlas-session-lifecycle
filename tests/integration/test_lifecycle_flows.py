@@ -179,10 +179,11 @@ class TestReconcileFlow:
 
 class TestSettlementFlow:
     """Settlement flow: hook_activate -> harvest -> hook_deactivate -> archive.
-    Verifies lifecycle file removal and purpose archival."""
+    Verifies lifecycle tombstone and purpose archival (schema v2)."""
 
     def test_complete_settlement(self, project_with_soul_purpose):
         """Walk through a complete settlement sequence."""
+        import json as _json
         pd = str(project_with_soul_purpose)
         sd = project_with_soul_purpose / "session-context"
 
@@ -200,11 +201,16 @@ class TestSettlementFlow:
         assert "patterns" in h["target_files"]
         assert "troubleshooting" in h["target_files"]
 
-        # 3. Hook deactivate -> removes lifecycle state
+        # 3. Hook deactivate -> tombstones lifecycle state (v2 behaviour)
         hd = hook_deactivate(pd)
         assert hd["status"] == "ok"
         assert hd["was_active"] is True
-        assert not (sd / LIFECYCLE_STATE_FILENAME).is_file()
+        tomb = sd / LIFECYCLE_STATE_FILENAME
+        assert tomb.is_file(), "tombstone must remain on disk for audit history"
+        tomb_state = _json.loads(tomb.read_text())
+        assert tomb_state["active"] is False
+        assert tomb_state["state"] == "closed"
+        assert "closed_at" in tomb_state
 
         # 4. Archive -> closes purpose, resets active context
         a = archive(pd, "Build a widget factory")
