@@ -9,6 +9,7 @@ prevent path traversal attacks.
 """
 
 import json
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -452,6 +453,11 @@ def read_context(project_dir: str) -> dict:
         "ralph_intensity": "",
         "session_state": None,  # NEW: Active | Paused | Closing
         "focus_status": None,  # NEW: In Progress | Blocked | Done | Moving To Next
+        # Harvest loop: tail entries from the three promoted-memory files so
+        # they stop being write-only. Each entry is {"heading", "date", "body_preview"}.
+        "recent_decisions": [],
+        "recent_patterns": [],
+        "recent_troubleshooting": [],
     }
 
     # Read soul purpose
@@ -540,12 +546,181 @@ def read_context(project_dir: str) -> dict:
                 elif line.strip().startswith("**Intensity**:"):
                     result["ralph_intensity"] = line.split("**Intensity**:")[1].strip()
 
+    # Surface last 5 entries from each promoted-memory file. This is the
+    # load-bearing fix that makes decisions/patterns/troubleshooting
+    # round-trip instead of being write-only.
+    for kind, field in (
+        ("decisions", "recent_decisions"),
+        ("patterns", "recent_patterns"),
+        ("troubleshooting", "recent_troubleshooting"),
+    ):
+        f = sd / f"CLAUDE-{kind}.md"
+        if not f.is_file():
+            continue
+        try:
+            entries = _tail_md_entries(f.read_text(errors="replace"), limit=5)
+        except Exception:
+            entries = []
+        result[field] = entries
+
     return result
+
+
+def _tail_md_entries(content: str, limit: int = 5) -> list[dict]:
+    """Parse a markdown file into `##` heading entries and return the last N.
+
+    Each entry: {heading, body_preview (first 200 chars), line_count}.
+    Order is oldest → newest so callers can just take the tail.
+    """
+    lines = content.split("\n")
+    entries: list[dict] = []
+    current: dict | None = None
+    for line in lines:
+        if line.startswith("## ") and not line.startswith("### "):
+            if current is not None:
+                entries.append(current)
+            current = {
+                "heading": line[3:].strip(),
+                "body_lines": [],
+            }
+        elif current is not None:
+            current["body_lines"].append(line)
+    if current is not None:
+        entries.append(current)
+
+    tail = entries[-limit:] if limit > 0 else entries
+    return [
+        {
+            "heading": e["heading"],
+            "body_preview": "\n".join(e["body_lines"]).strip()[:200],
+            "line_count": len(e["body_lines"]),
+        }
+        for e in tail
+    ]
 # ---------------------------------------------------------------------------
 
 
-def harvest(project_dir: str) -> dict:
-    """Scan active context for promotable content."""
+# ---------------------------------------------------------------------------
+# harvest — promote tagged blocks from activeContext to target files
+# ---------------------------------------------------------------------------
+
+# Tag → target file mapping. Headings in activeContext that begin with one of
+# these bracketed tags are candidates for promotion. FIX/BUG/GOTCHA collapse to
+# troubleshooting. The pragma `→ promote:<kind>` on any heading forces a target.
+_HARVEST_TAG_MAP = {
+    "[DECISION]": "decisions",
+    "[PATTERN]": "patterns",
+    "[TROUBLESHOOTING]": "troubleshooting",
+    "[FIX]": "troubleshooting",
+    "[BUG]": "troubleshooting",
+    "[GOTCHA]": "troubleshooting",
+}
+
+_HARVEST_PROMOTE_PRAGMA = re.compile(
+    r"(?:→|->)\s*promote\s*:\s*(decisions|patterns|troubleshooting)",
+    re.IGNORECASE,
+)
+
+# Sections in activeContext that should NEVER be promoted — session-history
+# blocks written by /sync and /stop pause. These accumulate as journal entries.
+_HARVEST_SKIP_PREFIXES = ("[SYNC]", "[CHECKPOINT]", "[HARVEST]")
+
+# Idempotency marker. Once a block has been promoted we replace it in
+# activeContext with a compact breadcrumb line that starts with this prefix.
+# harvest() refuses to re-promote breadcrumbs, so running twice is a no-op.
+_HARVEST_BREADCRUMB_PREFIX = "- [promoted "
+
+
+def _harvest_slug(text: str, maxlen: int = 40) -> str:
+    """Make a filesystem-safe slug from a heading or purpose string."""
+    if not text:
+        return "session"
+    s = re.sub(r"[^\w\s-]", "", text).strip().lower()
+    s = re.sub(r"[\s_-]+", "-", s)
+    return s[:maxlen] or "session"
+
+
+def _harvest_classify_heading(heading: str) -> tuple[str | None, str]:
+    """Return (target_file_key, cleaned_title) or (None, heading) if not promotable.
+
+    Detection order:
+      1. Explicit `→ promote:<kind>` pragma (wins over tags).
+      2. Bracketed tag prefix `[DECISION]` / `[PATTERN]` / etc.
+      3. Everything else → None (not promotable).
+    """
+    text = heading.strip()
+
+    pragma = _HARVEST_PROMOTE_PRAGMA.search(text)
+    if pragma:
+        target = pragma.group(1).lower()
+        cleaned = _HARVEST_PROMOTE_PRAGMA.sub("", text).strip(" →->")
+        return target, cleaned or heading
+
+    for prefix in _HARVEST_SKIP_PREFIXES:
+        if text.startswith(prefix):
+            return None, heading
+
+    for tag, target in _HARVEST_TAG_MAP.items():
+        if text.startswith(tag):
+            cleaned = text[len(tag):].strip(" -:")
+            return target, cleaned or heading
+
+    return None, heading
+
+
+def _harvest_split_blocks(content: str) -> list[dict]:
+    """Split activeContext content into top-level `##` heading blocks.
+
+    Each block is a dict with keys:
+      - heading_line: the raw `## ...` line
+      - body: the lines after the heading up to (but not including) the next `## `
+      - start_idx / end_idx: line indices in the original content
+    """
+    lines = content.split("\n")
+    blocks: list[dict] = []
+    current: dict | None = None
+    for i, line in enumerate(lines):
+        if line.startswith("## ") and not line.startswith("### "):
+            if current is not None:
+                current["end_idx"] = i
+                blocks.append(current)
+            current = {
+                "heading_line": line,
+                "heading_text": line[3:].strip(),
+                "start_idx": i,
+                "end_idx": len(lines),
+                "body_lines": [],
+            }
+        elif current is not None:
+            current["body_lines"].append(line)
+    if current is not None:
+        blocks.append(current)
+    return blocks
+
+
+def harvest(project_dir: str, dry_run: bool = False) -> dict:
+    """Promote tagged `##` blocks from activeContext to target files.
+
+    Marker scheme:
+      - `## [DECISION] ...` → CLAUDE-decisions.md
+      - `## [PATTERN] ...`  → CLAUDE-patterns.md
+      - `## [TROUBLESHOOTING] ...` / `[FIX]` / `[BUG]` / `[GOTCHA]` → CLAUDE-troubleshooting.md
+      - `## Any heading → promote:decisions` — explicit pragma also wins
+      - `## [SYNC] ...` / `## [CHECKPOINT] ...` are journal entries and NEVER promoted
+
+    Each promoted block is prefixed with a timestamp + soul-purpose slug and
+    appended to its target file. The original block in activeContext is
+    replaced with a one-line breadcrumb so scrolling activeContext still shows
+    the shape of past sessions without re-promoting on the next call.
+
+    Backwards compat: legacy callers that read `active_context` / `target_files`
+    still get those keys. New fields: `promoted_count`, `by_kind`, `blocks`,
+    `files_touched`, `dry_run`.
+
+    Args:
+        project_dir: Project root (resolved + validated).
+        dry_run: If True, compute what WOULD be promoted without writing.
+    """
     sd = session_dir(project_dir)
     ac_file = sd / "CLAUDE-activeContext.md"
     if not ac_file.is_file():
@@ -555,17 +730,166 @@ def harvest(project_dir: str) -> dict:
     template_path = TEMPLATE_DIR / "CLAUDE-activeContext.md"
     template = template_path.read_text() if template_path.is_file() else ""
 
+    target_files = {
+        "decisions": sd / "CLAUDE-decisions.md",
+        "patterns": sd / "CLAUDE-patterns.md",
+        "troubleshooting": sd / "CLAUDE-troubleshooting.md",
+    }
+
+    # Legacy shape — keep so existing callers don't break.
+    legacy_shape = {
+        "active_context": ac_content,
+        "target_files": {k: str(v) for k, v in target_files.items()},
+    }
+
     if ac_content.strip() == template.strip() or len(ac_content.strip()) < 100:
-        return {"status": "nothing", "message": "Active context is in template state."}
+        return {
+            "status": "nothing",
+            "message": "Active context is in template state.",
+            "promoted_count": 0,
+            "by_kind": {"decisions": 0, "patterns": 0, "troubleshooting": 0},
+            "blocks": [],
+            "files_touched": [],
+            "dry_run": dry_run,
+            **legacy_shape,
+        }
+
+    # Pull soul-purpose slug for attribution in promoted entries.
+    sp_file = sd / "CLAUDE-soul-purpose.md"
+    soul_slug = "session"
+    if sp_file.is_file():
+        for line in sp_file.read_text(errors="replace").split("\n"):
+            s = line.strip()
+            if s and not s.startswith("#") and s != "---" and "[CLOSED]" not in s:
+                soul_slug = _harvest_slug(s)
+                break
+
+    now = datetime.now(timezone.utc)
+    ts_human = now.strftime("%Y-%m-%d %H:%M UTC")
+    ts_short = now.strftime("%Y-%m-%d")
+
+    blocks = _harvest_split_blocks(ac_content)
+    by_kind = {"decisions": 0, "patterns": 0, "troubleshooting": 0}
+    block_reports: list[dict] = []
+    promotions: dict[str, list[str]] = {k: [] for k in target_files}
+    promoted_block_indices: set[int] = set()
+
+    for idx, block in enumerate(blocks):
+        heading = block["heading_text"]
+
+        # Never re-promote breadcrumbs or the block itself if it *is* a
+        # breadcrumb line mistakenly promoted to heading status.
+        if heading.startswith("[promoted"):
+            continue
+
+        target, cleaned_title = _harvest_classify_heading(heading)
+        if target is None:
+            continue
+
+        body = "\n".join(block["body_lines"]).rstrip()
+
+        # Compose the promoted entry for the target file.
+        entry = (
+            f"\n## {ts_human} — {soul_slug}\n"
+            f"### {cleaned_title}\n"
+            f"{body}\n"
+        )
+        promotions[target].append(entry)
+        by_kind[target] += 1
+        promoted_block_indices.add(idx)
+        block_reports.append(
+            {
+                "heading": heading,
+                "target": target,
+                "body_preview": body[:120],
+                "body_lines": len(block["body_lines"]),
+            }
+        )
+
+    promoted_count = sum(by_kind.values())
+
+    if promoted_count == 0:
+        return {
+            "status": "nothing_to_promote",
+            "message": (
+                "Active context has content but no tagged blocks. "
+                "Use `## [DECISION] ...`, `## [PATTERN] ...`, or "
+                "`## [TROUBLESHOOTING] ...` headings to mark promotable content."
+            ),
+            "promoted_count": 0,
+            "by_kind": by_kind,
+            "blocks": [],
+            "files_touched": [],
+            "dry_run": dry_run,
+            **legacy_shape,
+        }
+
+    files_touched: list[str] = []
+
+    if not dry_run:
+        # Append promoted entries to target files.
+        for target, entries in promotions.items():
+            if not entries:
+                continue
+            dest = target_files[target]
+            existing = dest.read_text(errors="replace") if dest.is_file() else ""
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            dest.write_text(existing + "".join(entries))
+            files_touched.append(str(dest))
+
+        # Rewrite activeContext: replace promoted blocks with breadcrumbs.
+        lines = ac_content.split("\n")
+        new_lines: list[str] = []
+        # Walk blocks in order, stitching together: pre-block prefix,
+        # breadcrumbs for promoted blocks, and original content otherwise.
+        cursor = 0
+        for idx, block in enumerate(blocks):
+            # Content before this block (preamble or between-block text)
+            if block["start_idx"] > cursor:
+                new_lines.extend(lines[cursor:block["start_idx"]])
+            if idx in promoted_block_indices:
+                target = next(
+                    (r["target"] for r in block_reports if r["heading"] == block["heading_text"]),
+                    "decisions",
+                )
+                heading_text = block["heading_text"]
+                # Strip leading tag for the breadcrumb so it reads cleanly
+                for tag in _HARVEST_TAG_MAP:
+                    if heading_text.startswith(tag):
+                        heading_text = heading_text[len(tag):].strip(" -:")
+                        break
+                # Singular label for the breadcrumb — "decisions" → "DECISION".
+                singular = {
+                    "decisions": "DECISION",
+                    "patterns": "PATTERN",
+                    "troubleshooting": "TROUBLESHOOTING",
+                }[target]
+                breadcrumb = (
+                    f"{_HARVEST_BREADCRUMB_PREFIX}{singular} "
+                    f"→ CLAUDE-{target}.md {ts_short}] {heading_text}"
+                )
+                new_lines.append(breadcrumb)
+            else:
+                new_lines.extend(lines[block["start_idx"]:block["end_idx"]])
+            cursor = block["end_idx"]
+        # Tail after the last block
+        if cursor < len(lines):
+            new_lines.extend(lines[cursor:])
+
+        ac_file.write_text("\n".join(new_lines))
 
     return {
-        "status": "has_content",
-        "active_context": ac_content,
-        "target_files": {
-            "decisions": str(sd / "CLAUDE-decisions.md"),
-            "patterns": str(sd / "CLAUDE-patterns.md"),
-            "troubleshooting": str(sd / "CLAUDE-troubleshooting.md"),
-        },
+        "status": "promoted" if not dry_run else "dry_run",
+        "promoted_count": promoted_count,
+        "by_kind": by_kind,
+        "blocks": block_reports,
+        "files_touched": files_touched,
+        "dry_run": dry_run,
+        "soul_slug": soul_slug,
+        "timestamp": ts_human,
+        # Legacy shape preserved
+        **legacy_shape,
     }
 
 
@@ -604,6 +928,31 @@ def archive(
                 new_content = new_content.rstrip() + f"\n\n{old_archives}\n"
                 break
 
+    # Snapshot all session-context files into an archive subdir BEFORE any
+    # mutation. This makes session closure recoverable — old /stop flows
+    # reset activeContext with no recovery path.
+    snapshot_slug = _harvest_slug(old_purpose or "session")
+    snapshot_dir = sd / "archive" / f"{today}-{snapshot_slug}"
+    snapshot_files: list[str] = []
+    try:
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        for fname in (
+            "CLAUDE-activeContext.md",
+            "CLAUDE-decisions.md",
+            "CLAUDE-patterns.md",
+            "CLAUDE-troubleshooting.md",
+            "CLAUDE-soul-purpose.md",
+        ):
+            src = sd / fname
+            if src.is_file():
+                shutil.copy2(src, snapshot_dir / fname)
+                snapshot_files.append(fname)
+    except Exception as exc:  # pragma: no cover — snapshot is best-effort
+        snapshot_dir = None
+        snapshot_err = str(exc)
+    else:
+        snapshot_err = None
+
     sp_file.write_text(new_content)
 
     # Reset active context from template
@@ -619,6 +968,9 @@ def archive(
         "archived_purpose": old_purpose[:80] + "..." if len(old_purpose) > 80 else old_purpose,
         "new_purpose": new_purpose or "(No active soul purpose)",
         "active_context_reset": True,
+        "snapshot_dir": str(snapshot_dir) if snapshot_dir else None,
+        "snapshot_files": snapshot_files,
+        "snapshot_error": snapshot_err,
     }
 
 
@@ -1545,9 +1897,11 @@ def close_composite(project_dir: str) -> dict:
         "hook": None,
     }
 
-    # 1. Harvest — scan for promotable content
+    # 1. Harvest — DRY RUN for composite. The composite is called by /stop
+    # which must preview before mutation. Actual promotion happens when /stop
+    # calls harvest() explicitly with dry_run=False after user approval.
     try:
-        result["harvest"] = harvest(project_dir)
+        result["harvest"] = harvest(project_dir, dry_run=True)
     except Exception as e:
         result["harvest"] = {"status": "error", "error": str(e)}
 

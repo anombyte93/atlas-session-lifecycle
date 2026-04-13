@@ -45,11 +45,24 @@ def register(mcp: FastMCP) -> None:
         return ops.read_context(project_dir)
 
     @mcp.tool
-    def session_harvest(project_dir: str) -> dict:
-        """Scan active context for content worth promoting to decisions,
-        patterns, or troubleshooting files. Returns raw content for AI
-        judgment on what qualifies."""
-        return ops.harvest(project_dir)
+    def session_harvest(project_dir: str, dry_run: bool = False) -> dict:
+        """Promote tagged `##` blocks from CLAUDE-activeContext.md into
+        CLAUDE-decisions.md / CLAUDE-patterns.md / CLAUDE-troubleshooting.md.
+
+        Marker scheme (headings in activeContext):
+          - `## [DECISION] ...` → decisions
+          - `## [PATTERN] ...`  → patterns
+          - `## [TROUBLESHOOTING] ...` / `[FIX]` / `[BUG]` / `[GOTCHA]` → troubleshooting
+          - `## Any heading → promote:patterns` — explicit pragma override
+          - `## [SYNC] ...` and `## [CHECKPOINT] ...` are NEVER promoted
+
+        Promoted blocks are replaced in activeContext with a compact
+        breadcrumb line, making the operation idempotent. Set `dry_run=True`
+        to preview what WOULD be promoted without writing. Legacy caller
+        shape (`active_context`, `target_files`) is preserved for backwards
+        compatibility.
+        """
+        return ops.harvest(project_dir, dry_run=dry_run)
 
     @mcp.tool
     def session_archive(
