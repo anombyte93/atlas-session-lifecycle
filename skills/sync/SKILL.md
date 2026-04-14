@@ -23,6 +23,15 @@ user-invocable: true
 
 Use the current time formatted as `HH:MM DD/MM/YY` for the checkpoint header.
 
+### 0. Touch lifecycle liveness marker
+
+Call `session_hook_touch_sync(project_dir=<cwd>)` via the `atlas-session`
+MCP. This stamps `last_sync_at` on
+`session-context/.lifecycle-active.json` so the fleet audit script
+(`fleet-sync-audit.sh`) can classify session liveness (active/idle/stale).
+Backward-compatible: creates the v2 file if it doesn't exist. Non-fatal on
+error — never block sync on fleet telemetry.
+
 ### 1. Edit `session-context/CLAUDE-activeContext.md`
 
 Append a new section at the end:
@@ -70,11 +79,31 @@ Append new issues and solutions. If none, append:
 No new issues this session.
 ```
 
-### 5. Update MEMORY.md
+### 5. Export tasks to `session-context/CLAUDE-tasks.md`
+
+Call `TaskList`. If any tasks exist (pending, in_progress, or completed):
+- Write (overwrite) `session-context/CLAUDE-tasks.md` with:
+
+  ```markdown
+  ## Tasks [HH:MM DD/MM/YY]
+
+  ### In Progress
+  - [~] #N subject
+
+  ### Pending
+  - [ ] #N subject
+
+  ### Completed (this session)
+  - [x] #N subject
+  ```
+
+If no tasks exist, skip this step (don't create an empty file).
+
+### 6. Update MEMORY.md
 
 Update the auto-memory file at the project memory path with any new learnings from this session. If nothing new, skip this file (memory should stay concise).
 
-### 6. Print summary
+### 7. Print summary
 
 Print exactly one block:
 
@@ -84,6 +113,7 @@ Synced. {N} files updated.
 - Decisions: {count new or "no new"}
 - Patterns: {count new or "no new"}
 - Troubleshooting: {count new or "no new"}
+- Tasks: {N pending, N in_progress exported} or "no tasks"
 - Memory: {updated or "no changes"}
 ```
 
@@ -95,7 +125,7 @@ Synced. {N} files updated.
 
 ### Execute
 
-1. Run standard sync flow (Steps 1-5 above).
+1. Run standard sync flow (Steps 1-6 above).
 2. Call `session_capability_inventory(project_dir, force_refresh=True)` — bypasses cache and regenerates inventory even if git unchanged.
 3. If `needs_generation == True`: the MCP tool will generate the inventory.
 4. Read `CLAUDE-capability-inventory.md` if it exists.
