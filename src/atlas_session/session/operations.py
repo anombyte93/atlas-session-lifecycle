@@ -450,6 +450,8 @@ def read_context(project_dir: str) -> dict:
         "status_hint": "unknown",
         "ralph_mode": "",
         "ralph_intensity": "",
+        "session_state": None,  # NEW: Active | Paused | Closing
+        "focus_status": None,  # NEW: In Progress | Blocked | Done | Moving To Next
     }
 
     # Read soul purpose
@@ -484,10 +486,47 @@ def read_context(project_dir: str) -> dict:
 
         for line in ac_content.split("\n"):
             stripped = line.strip()
-            if "[ ]" in stripped:
+            # Parse new fields (Session State, Focus Status)
+            if stripped.startswith("- **Session State**:") or "**Session State**:" in stripped:
+                for state in ["Active", "Paused", "Closing"]:
+                    if state in stripped:
+                        result["session_state"] = state.lower()
+            elif stripped.startswith("- **Focus Status**:") or "**Focus Status**:" in stripped:
+                for status in ["In Progress", "Blocked", "Done", "Moving To Next"]:
+                    if status in stripped:
+                        result["focus_status"] = status.lower().replace(" ", "_")
+            # Legacy "Status:" parsing for backward compatibility
+            elif stripped.startswith("- **Status**:"):
+                if "In Progress" in stripped:
+                    result["focus_status"] = "in_progress"
+                elif "Blocked" in stripped:
+                    result["focus_status"] = "blocked"
+                    result["status_hint"] = "blocked"
+                elif "Complete" in stripped:
+                    # Legacy "Complete" is ambiguous - interpret based on open_tasks
+                    if result.get("open_tasks"):
+                        result["focus_status"] = "done"
+                        result["status_hint"] = "moving_to_next"
+                    else:
+                        result["focus_status"] = "done"
+                        result["status_hint"] = "probably_complete"
+            # Parse tasks
+            elif "[ ]" in stripped:
                 result["open_tasks"].append(stripped.lstrip("- "))
             elif "[x]" in stripped.lower():
                 result["recent_progress"].append(stripped.lstrip("- "))
+
+        # Update status_hint based on new fields
+        if result["session_state"] == "closing":
+            result["status_hint"] = "closing"
+        elif result["focus_status"] == "blocked":
+            result["status_hint"] = "blocked"
+        elif result["focus_status"] == "done":
+            result["status_hint"] = "probably_complete"
+        elif result["focus_status"] == "moving_to_next":
+            result["status_hint"] = "moving_to_next"
+        elif result["open_tasks"]:
+            result["status_hint"] = "clearly_incomplete"
 
     # Extract ralph config from CLAUDE.md
     if cmd.is_file():
@@ -502,10 +541,6 @@ def read_context(project_dir: str) -> dict:
                     result["ralph_intensity"] = line.split("**Intensity**:")[1].strip()
 
     return result
-
-
-# ---------------------------------------------------------------------------
-# harvest
 # ---------------------------------------------------------------------------
 
 
@@ -826,16 +861,23 @@ def hook_activate(project_dir: str, soul_purpose: str) -> dict:
 
     Project-scoped (not global ~/.claude/) to prevent cross-project
     contamination. The stop hook reads this file to warn on exit.
+
+    Schema v2 adds `last_sync_at` (tracked by /sync) and `state`
+    enum ("active" | "idle" | "stale" | "closed") so fleet audits can
+    classify session liveness without relying on file presence alone.
     """
     sd = session_dir(project_dir)
     if not sd.is_dir():
         return {"status": "error", "message": "session-context/ does not exist"}
 
+    now = datetime.now(timezone.utc).isoformat()
     state = {
         "active": True,
         "soul_purpose": soul_purpose,
-        "activated_at": datetime.now(timezone.utc).isoformat(),
+        "activated_at": now,
         "project_dir": project_dir,
+        "last_sync_at": now,
+        "state": "active",
     }
 
     state_file = sd / LIFECYCLE_STATE_FILENAME
@@ -845,20 +887,98 @@ def hook_activate(project_dir: str, soul_purpose: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# hook_touch_sync — called by /sync to stamp last_sync_at
+# ---------------------------------------------------------------------------
+
+
+def hook_touch_sync(project_dir: str, soul_purpose: str = "") -> dict:
+    """Update `last_sync_at` on the lifecycle file. Called by /sync.
+
+    Backward-compatible: if the file is missing (pre-v2 session started
+    before this fix shipped), create a minimal one using the session-context
+    mtime as a best-effort `activated_at`. If present but missing v2 fields,
+    fill them in-place without destroying existing data.
+    """
+    sd = session_dir(project_dir)
+    if not sd.is_dir():
+        return {"status": "error", "message": "session-context/ does not exist"}
+
+    state_file = sd / LIFECYCLE_STATE_FILENAME
+    now = datetime.now(timezone.utc).isoformat()
+
+    if state_file.is_file():
+        try:
+            state = json.loads(state_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            state = {}
+        created = False
+    else:
+        mtime = datetime.fromtimestamp(sd.stat().st_mtime, tz=timezone.utc).isoformat()
+        state = {
+            "active": True,
+            "soul_purpose": soul_purpose,
+            "activated_at": mtime,
+            "project_dir": project_dir,
+        }
+        created = True
+
+    # Fill v2 fields if missing (backward-compat for old files).
+    state.setdefault("active", True)
+    state.setdefault("soul_purpose", soul_purpose)
+    state.setdefault("activated_at", now)
+    state.setdefault("project_dir", project_dir)
+    state.setdefault("state", "active")
+
+    # Always update last_sync_at — this is the point of the call.
+    state["last_sync_at"] = now
+
+    # Atomic write: tmp + replace.
+    tmp = state_file.with_suffix(state_file.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(state_file)
+
+    return {"status": "ok", "file": str(state_file), "created": created}
+
+
+# ---------------------------------------------------------------------------
 # hook_deactivate
 # ---------------------------------------------------------------------------
 
 
 def hook_deactivate(project_dir: str) -> dict:
-    """Remove lifecycle state file. Idempotent."""
+    """Mark lifecycle file as closed (tombstone). Idempotent.
+
+    Previously this DELETED the file. That made audit/history impossible
+    because a missing file was indistinguishable from "never existed."
+    Now we write a tombstone: active=false, state="closed", closed_at=now.
+    Fleet audit scripts can classify closed sessions and skip them.
+    """
     sd = session_dir(project_dir)
     state_file = sd / LIFECYCLE_STATE_FILENAME
     was_active = state_file.is_file()
 
-    if was_active:
-        state_file.unlink()
+    now = datetime.now(timezone.utc).isoformat()
 
-    return {"status": "ok", "was_active": was_active}
+    if was_active:
+        try:
+            state = json.loads(state_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            state = {}
+    else:
+        # Nothing to tombstone — stay idempotent and silent.
+        return {"status": "ok", "was_active": False}
+
+    # Preserve existing fields, stamp tombstone markers.
+    state["active"] = False
+    state["state"] = "closed"
+    state["closed_at"] = now
+    state.setdefault("project_dir", project_dir)
+
+    tmp = state_file.with_suffix(state_file.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(state_file)
+
+    return {"status": "ok", "was_active": was_active, "tombstoned": True}
 
 
 # ---------------------------------------------------------------------------

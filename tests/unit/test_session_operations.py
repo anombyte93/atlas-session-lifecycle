@@ -24,6 +24,7 @@ from atlas_session.session.operations import (
     harvest,
     hook_activate,
     hook_deactivate,
+    hook_touch_sync,
     init,
     preflight,
     read_context,
@@ -701,22 +702,102 @@ class TestHookActivate:
 
 
 class TestHookDeactivate:
-    """Tests for the hook_deactivate() function."""
+    """Tests for the hook_deactivate() function.
 
-    def test_removes_file(self, project_with_session):
-        """Removes the lifecycle state file."""
+    Schema v2: deactivate now writes a tombstone (active=false,
+    state=closed, closed_at=now) instead of deleting the file, so
+    fleet audits can see closed-session history.
+    """
+
+    def test_tombstones_file(self, project_with_session):
+        """Marks lifecycle as closed rather than removing it."""
         hook_activate(str(project_with_session), "Build widgets")
         result = hook_deactivate(str(project_with_session))
         assert result["status"] == "ok"
         assert result["was_active"] is True
         state_file = project_with_session / "session-context" / LIFECYCLE_STATE_FILENAME
-        assert not state_file.is_file()
+        assert state_file.is_file(), "tombstone must remain on disk"
+        state = json.loads(state_file.read_text())
+        assert state["active"] is False
+        assert state["state"] == "closed"
+        assert "closed_at" in state
+        assert state["soul_purpose"] == "Build widgets"  # preserved
 
     def test_idempotent_when_no_file(self, project_with_session):
         """Returns ok even when no lifecycle file exists."""
         result = hook_deactivate(str(project_with_session))
         assert result["status"] == "ok"
         assert result["was_active"] is False
+
+
+class TestHookActivateSchemaV2:
+    """Schema v2 fields on hook_activate + backward compat."""
+
+    def test_activate_includes_last_sync_at_and_state(self, project_with_session):
+        hook_activate(str(project_with_session), "Build widgets")
+        state_file = project_with_session / "session-context" / LIFECYCLE_STATE_FILENAME
+        state = json.loads(state_file.read_text())
+        assert state["state"] == "active"
+        assert "last_sync_at" in state
+        # On fresh activate, last_sync_at == activated_at.
+        assert state["last_sync_at"] == state["activated_at"]
+
+    def test_backward_compat_read_v1_file(self, project_with_session):
+        """A pre-v2 file (no last_sync_at, no state) is still readable;
+        hook_touch_sync promotes it to v2 without destroying fields."""
+        state_file = project_with_session / "session-context" / LIFECYCLE_STATE_FILENAME
+        v1 = {
+            "active": True,
+            "soul_purpose": "legacy session",
+            "activated_at": "2025-01-01T00:00:00+00:00",
+            "project_dir": str(project_with_session),
+        }
+        state_file.write_text(json.dumps(v1))
+
+        result = hook_touch_sync(str(project_with_session))
+        assert result["status"] == "ok"
+        state = json.loads(state_file.read_text())
+        # v1 fields preserved:
+        assert state["soul_purpose"] == "legacy session"
+        assert state["activated_at"] == "2025-01-01T00:00:00+00:00"
+        # v2 fields filled in:
+        assert state["state"] == "active"
+        assert "last_sync_at" in state
+        assert state["last_sync_at"] != state["activated_at"]
+
+
+class TestHookTouchSync:
+    """Tests for hook_touch_sync() — the /sync integration point."""
+
+    def test_updates_last_sync_at(self, project_with_session):
+        hook_activate(str(project_with_session), "Build widgets")
+        state_file = project_with_session / "session-context" / LIFECYCLE_STATE_FILENAME
+        before = json.loads(state_file.read_text())["last_sync_at"]
+
+        # Stall so ISO timestamps differ at microsecond resolution.
+        import time
+        time.sleep(0.01)
+
+        result = hook_touch_sync(str(project_with_session))
+        assert result["status"] == "ok"
+        assert result["created"] is False
+        after = json.loads(state_file.read_text())["last_sync_at"]
+        assert after > before
+
+    def test_creates_file_when_missing(self, project_with_session):
+        """Sessions that started before the fix have no lifecycle file.
+        hook_touch_sync should create a minimal v2 one."""
+        state_file = project_with_session / "session-context" / LIFECYCLE_STATE_FILENAME
+        assert not state_file.is_file()
+
+        result = hook_touch_sync(str(project_with_session), "Recovered session")
+        assert result["status"] == "ok"
+        assert result["created"] is True
+        assert state_file.is_file()
+        state = json.loads(state_file.read_text())
+        assert state["state"] == "active"
+        assert state["soul_purpose"] == "Recovered session"
+        assert "last_sync_at" in state
 
 
 class TestFeaturesRead:
